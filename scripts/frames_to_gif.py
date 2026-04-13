@@ -114,6 +114,7 @@ def render_frame(frame_data, benchmark, net_edges, net_alpha, save_path, dpi):
     gamma       = frame_data["gamma"]
     lambda_d    = frame_data.get("lambda_d", None)
     alpha       = frame_data.get("alpha", None)
+    overflow    = frame_data.get("overflow", None)
     canvas_w    = frame_data["canvas_width"]
     canvas_h    = frame_data["canvas_height"]
     macro_sizes = frame_data["macro_sizes"]   # [N, 2]
@@ -165,12 +166,12 @@ def render_frame(frame_data, benchmark, net_edges, net_alpha, save_path, dpi):
         w, h = macro_sizes[i].tolist()
         is_soft  = i >= num_hard
         is_fixed = benchmark.macro_fixed[i].item()
-        color    = "red" if is_fixed else "mediumseagreen" if is_soft else "steelblue"
-        alpha    = 0.25 if is_soft else 0.5
+        color      = "red" if is_fixed else "mediumseagreen" if is_soft else "steelblue"
+        rect_alpha = 0.25 if is_soft else 0.5
         ax.add_patch(Rectangle(
             (x - w / 2, y - h / 2), w, h,
             facecolor=color, edgecolor="black",
-            alpha=alpha, linewidth=0.3, zorder=2,
+            alpha=rect_alpha, linewidth=0.3, zorder=2,
         ))
 
     # ── I/O ports ─────────────────────────────────────────────────────────
@@ -185,9 +186,15 @@ def render_frame(frame_data, benchmark, net_edges, net_alpha, save_path, dpi):
     nets_label   = f"  {net_edges['num_nets']}nets" if net_edges is not None else ""
     alpha_label  = f"   α={alpha:.4f}" if alpha is not None else ""
     lambda_label = f"   λ={lambda_d:.2e}" if lambda_d is not None else ""
+    if overflow is None:
+        ovfw_str = ""
+    elif overflow == float("inf"):
+        ovfw_str = "   ovfw=∞"
+    else:
+        ovfw_str = f"   ovfw={overflow:.3f}"
     ax.set_title(
         f"{name}{nets_label}  |  iter {iteration:4d}   "
-        f"WL={wl_loss:.1f}   γ={gamma:.4f}{alpha_label}{lambda_label}",
+        f"WL={wl_loss:.1f}{ovfw_str}   γ={gamma:.4f}{alpha_label}{lambda_label}",
         fontsize=9,
     )
     ax.set_xlabel("x (um)")

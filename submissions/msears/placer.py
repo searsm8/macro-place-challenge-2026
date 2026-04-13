@@ -327,6 +327,9 @@ class MSPlacer:
         self.hpwl_gradient_method = p.get("hpwl_gradient_method", "wa")
         self.legalization         = p.get("legalization", "none")
         self.use_preconditioner   = p.get("use_preconditioner", True)
+        self.optimizer  = p.get("optimizer", "sgd")
+        # "auto" -> canvas_diag * 0.005 (same as max_step default); float overrides
+        self.alpha_init = None if p.get("alpha_init", "auto") == "auto" else float(p["alpha_init"])
 
         # ── Lambda schedule ───────────────────────────────────────────────
         self.lambda_schedule      = p.get("lambda_schedule", "hpwl")
@@ -483,10 +486,26 @@ class MSPlacer:
         overflow_history: list[float] = []  # for divergence trend
         ref_hpwl       = 1.0           # set at warmup end for hpwl lambda schedule
 
+        # ── BB / Nesterov state ────────────────────────────────────────────
+        # alpha_k: Barzilai-Borwein step size (replaces fixed max_step clip)
+        # u_k / v_k: actual / look-ahead positions for Nesterov mode
+        # g_prev / v_prev: previous gradient & position for BB computation
+        if self.optimizer in ("bb_sgd", "nesterov"):
+            alpha_k = self.alpha_init or max_step  # default same scale as old max_step
+            g_prev  = None   # flattened gradient at previous eval point
+            v_prev  = None   # flattened previous eval position
+        if self.optimizer == "nesterov":
+            u_k = pos.clone()   # actual solution
+            v_k = pos.clone()   # look-ahead point
+            a_k = 1.0           # Nesterov coefficient
+
+        _alpha0 = self.alpha_init or max_step
+        opt_info = (f"{self.optimizer}  alpha_init={_alpha0:.4f}  max_step={max_step:.4f}"
+                    if self.optimizer != "sgd" else f"sgd  max_step={max_step:.4f}")
         self._log(f"  Gradient descent: {self.max_iters} iters  "
-                  f"gamma0={gamma:.3f}  max_step={max_step:.4f}  "
-                  f"gamma_min={gamma_min:.4f}  warmup={self.warmup_iters}  "
-                  f"stop_overflow={self.stop_overflow}")
+                  f"gamma0={gamma:.3f}  gamma_min={gamma_min:.4f}  "
+                  f"warmup={self.warmup_iters}  stop_overflow={self.stop_overflow}  "
+                  f"optimizer={opt_info}")
 
         # Prepare frame export directory (cleared fresh each run)
         if self.record_frames:
@@ -516,8 +535,12 @@ class MSPlacer:
 
         for t in range(self.max_iters):
 
+            # ── Evaluate gradients at look-ahead point ────────────────────
+            # Nesterov: at v_k (look-ahead); bb_sgd / sgd: at current pos.
+            eval_pos = v_k if self.optimizer == "nesterov" else pos
+
             # ── WL gradient (via PyTorch autograd) ────────────────────────
-            pos_var = pos.detach().requires_grad_(True)
+            pos_var = eval_pos.detach().requires_grad_(True)
             wl_loss = _wa_hpwl(pos_var, net_data, gamma)
             wl_loss.backward()
             wl_grad = pos_var.grad.clone()   # [n, 2]
@@ -530,7 +553,7 @@ class MSPlacer:
                              and self.lambda_schedule == "hpwl"))
             if need_density:
                 den_grad, den_energy, overflow, max_den = _density.compute_density_gradient(
-                    self.density_method, pos, benchmark, self.target_density)
+                    self.density_method, eval_pos, benchmark, self.target_density)
             else:
                 den_grad   = torch.zeros_like(pos)
                 den_energy = 0.0
@@ -546,27 +569,94 @@ class MSPlacer:
                 # Fixed macros do not move
                 grad[fixed_mask] = 0.0
 
-                # Per-macro clipping: limit each macro's movement to max_step
-                per_macro_norm = grad.norm(dim=1, keepdim=True).clamp(min=1e-8)
-                scale = (max_step / per_macro_norm).clamp(max=1.0)
-                grad = grad * scale
-                alpha = grad[~fixed_mask].norm(dim=1).mean().item()
+                if self.optimizer in ("bb_sgd", "nesterov"):
+                    # ── Barzilai-Borwein adaptive step size ───────────────
+                    # Short BB: alpha = (s·y)/(y·y) where s=position diff,
+                    # y=gradient diff. Falls back to Lipschitz |s|/|y| when
+                    # short BB is non-positive (non-convex curvature).
+                    # max_step is a hard safety cap per macro (not per scalar).
+                    g_k_flat   = grad.reshape(-1)
+                    eval_flat  = eval_pos.reshape(-1)
 
-                # Gradient descent step
-                pos = pos.detach() - grad
+                    if g_prev is not None:
+                        s_k = eval_flat - v_prev
+                        y_k = g_k_flat - g_prev
+                        sy  = torch.dot(s_k, y_k).item()
+                        yy  = torch.dot(y_k, y_k).item()
+                        ss  = torch.dot(s_k, s_k).item()
+                        if sy > 0.0 and yy > 1e-20:
+                            alpha_k = sy / yy       # short BB
+                        elif ss > 1e-20 and yy > 1e-20:
+                            alpha_k = (ss ** 0.5) / (yy ** 0.5)  # Lipschitz fallback
+                        # else keep previous alpha_k
 
-                # Keep macro centers inside canvas
-                pos[:, 0] = pos[:, 0].clamp(min=half_w, max=cw - half_w)
-                pos[:, 1] = pos[:, 1].clamp(min=half_h, max=ch - half_h)
+                    g_prev = g_k_flat.clone()
+                    v_prev = eval_flat.clone()
 
-                # Restore fixed macros
-                pos[fixed_mask] = init_pos[fixed_mask]
+                    # Scaled step with per-macro clip as safety net
+                    step_vec  = alpha_k * grad
+                    step_norm = step_vec.norm(dim=1, keepdim=True).clamp(min=1e-8)
+                    step_vec  = step_vec * (max_step / step_norm).clamp(max=1.0)
+
+                    if self.optimizer == "nesterov":
+                        # ── Nesterov momentum update ──────────────────────
+                        # Restart if WL is rising (landscape shifted by λ ramp
+                        # or momentum overshooting). Keeps actual pos, resets
+                        # look-ahead v_k and momentum coefficient a_k.
+                        if prev_wl < float("inf") and wl_loss.item() > prev_wl * 1.05:
+                            v_k = pos.clone()
+                            a_k = 1.0
+
+                        a_kp1 = (1.0 + (1.0 + 4.0 * a_k * a_k) ** 0.5) / 2.0
+                        coef  = (a_k - 1.0) / a_kp1
+
+                        u_kp1 = v_k.detach() - step_vec
+                        u_kp1[fixed_mask] = init_pos[fixed_mask]
+                        u_kp1[:, 0] = u_kp1[:, 0].clamp(min=half_w, max=cw - half_w)
+                        u_kp1[:, 1] = u_kp1[:, 1].clamp(min=half_h, max=ch - half_h)
+
+                        v_kp1 = u_kp1 + coef * (u_kp1 - u_k)
+                        v_kp1[fixed_mask] = init_pos[fixed_mask]
+                        v_kp1[:, 0] = v_kp1[:, 0].clamp(min=half_w, max=cw - half_w)
+                        v_kp1[:, 1] = v_kp1[:, 1].clamp(min=half_h, max=ch - half_h)
+
+                        u_k = u_kp1
+                        v_k = v_kp1
+                        a_k = a_kp1
+                        pos = u_k
+                    else:
+                        # ── BB-SGD (BB step, no momentum) ─────────────────
+                        pos = pos.detach() - step_vec
+                        pos[:, 0] = pos[:, 0].clamp(min=half_w, max=cw - half_w)
+                        pos[:, 1] = pos[:, 1].clamp(min=half_h, max=ch - half_h)
+                        pos[fixed_mask] = init_pos[fixed_mask]
+
+                    alpha = step_vec[~fixed_mask].norm(dim=1).mean().item()
+
+                else:
+                    # ── SGD with per-macro clipping ───────────────────────
+                    per_macro_norm = grad.norm(dim=1, keepdim=True).clamp(min=1e-8)
+                    # Report gradient norm BEFORE clipping — this varies during
+                    # training and is more informative than the clipped step
+                    # (which is always ≈ max_step since gradients are always large).
+                    alpha = per_macro_norm[~fixed_mask].mean().item()
+                    scale = (max_step / per_macro_norm).clamp(max=1.0)
+                    grad  = grad * scale
+
+                    pos = pos.detach() - grad
+                    pos[:, 0] = pos[:, 0].clamp(min=half_w, max=cw - half_w)
+                    pos[:, 1] = pos[:, 1].clamp(min=half_h, max=ch - half_h)
+                    pos[fixed_mask] = init_pos[fixed_mask]
 
                 # NaN safety: restore from best snapshot if positions blow up
                 if torch.isnan(pos).any():
                     self._log(f"  [NaN]       iter {t}: positions contain NaN, "
                               f"restoring best snapshot and stopping")
                     pos = best_pos.clone()
+                    if self.optimizer == "nesterov":
+                        u_k = pos.clone()
+                        v_k = pos.clone()
+                        a_k = 1.0
                     break
 
             wl_val = wl_loss.item()

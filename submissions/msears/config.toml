@@ -28,6 +28,8 @@ density_method        = "electrostatic"   # "bell" or "electrostatic"
 hpwl_gradient_method  = "wa"              # "wa" (weighted-average) — more to come
 legalization          = "spiral"          # "none" or "spiral"
 use_preconditioner    = true              # divide gradient by (macro_area + net_degree) per macro
+optimizer             = "bb_sgd"             # "sgd" (vanilla GD) or "bb_sgd" (BB adaptive step) or "nesterov" (NAG+BB)
+alpha_init            = "auto"            # initial step size for bb_sgd/nesterov; "auto" -> canvas_diag * 0.005
 
 # ── Lambda (density weight) schedule ──────────────────────────────────────
 lambda_schedule         = "hpwl"  # "hpwl" (feedback) or "geometric" (old fixed ramp)
@@ -46,7 +48,7 @@ density_weight_max_step = 1.04   # fixed ramp multiplier (geometric only)
 # shared
 warmup_iters            = 20     # WL-only iterations before density activates
 density_weight_max      = 100.0  # hard safety cap on λ (both modes)
-target_density          = 0.8    # target area utilization per grid cell
+target_density          = 0.65   # target area utilization per grid cell
 
 [output]
 log_every     = 50      # print WL loss every N iterations (0 = silent loop)
