@@ -47,7 +47,7 @@ def parse_args():
                         "(default: vis/frames)")
     p.add_argument("--output", "-o", default=None,
                    help="Output GIF path (default: vis/<benchmark>_opt.gif)")
-    p.add_argument("--fps", type=float, default=20,
+    p.add_argument("--fps", type=float, default=10,
                    help="Frames per second in the GIF (default: 20)")
     p.add_argument("--step", type=int, default=1,
                    help="Use every Nth frame, e.g. --step 5 (default: 1 = all frames)")
@@ -58,6 +58,11 @@ def parse_args():
     p.add_argument("--net-alpha", type=float, default=0.05,
                    help="Opacity of net lines (default: 0.05). "
                         "Raise to 0.1–0.2 for sparser benchmarks.")
+    p.add_argument("--highlight", nargs="+", default=[], metavar="MACRO_NAME",
+                   help="Macro names whose nets are drawn at alpha=0.95 "
+                        "(e.g. --highlight macro_0 macro_3)")
+    p.add_argument("--legal-only", action="store_true", default=False,
+                   help="Only render the legalized frame as a PNG (skip GIF)")
     return p.parse_args()
 
 
@@ -69,7 +74,11 @@ def load_benchmark_for_frames(benchmark_name):
     from macro_place.loader import load_benchmark_from_dir, load_benchmark
     from macro_place.benchmark import Benchmark
 
-    root = Path("external/MacroPlacement/Testcases/ICCAD04") / benchmark_name
+    # Anchor to the repo root (two levels up from scripts/) so this works
+    # regardless of the CWD the script is invoked from.
+    repo_root = Path(__file__).resolve().parent.parent
+
+    root = repo_root / "external/MacroPlacement/Testcases/ICCAD04" / benchmark_name
     if root.exists():
         benchmark, _ = load_benchmark_from_dir(str(root))
         return benchmark
@@ -82,7 +91,7 @@ def load_benchmark_for_frames(benchmark_name):
     }
     design = ng45_map.get(benchmark_name)
     if design:
-        base = (Path("external/MacroPlacement/Flows/NanGate45")
+        base = (repo_root / "external/MacroPlacement/Flows/NanGate45"
                 / design / "netlist" / "output_CT_Grouping")
         if (base / "netlist.pb.txt").exists():
             benchmark, _ = load_benchmark(
@@ -94,7 +103,8 @@ def load_benchmark_for_frames(benchmark_name):
     raise FileNotFoundError(f"Could not find benchmark '{benchmark_name}'")
 
 
-def render_frame(frame_data, benchmark, net_edges, net_alpha, save_path, dpi):
+def render_frame(frame_data, benchmark, net_edges, net_alpha, save_path, dpi,
+                 highlight_ids=None, label_override=None):
     """
     Render a single frame to a PNG using a custom single-panel matplotlib figure.
 
@@ -128,7 +138,8 @@ def render_frame(frame_data, benchmark, net_edges, net_alpha, save_path, dpi):
     ax.add_patch(Rectangle((0, 0), canvas_w, canvas_h,
                             fill=False, edgecolor="black", linewidth=1.5))
 
-    # ── Net connections (drawn first, underneath macros) ──────────────────
+    # ── Pre-compute pin positions (reused for nets and pin dots) ─────────
+    pin_pos = None
     if net_edges is not None:
         macro_ids  = net_edges["macro_ids"]      # [P]
         offsets    = net_edges["offsets"]        # [P, 2]
@@ -136,15 +147,13 @@ def render_frame(frame_data, benchmark, net_edges, net_alpha, save_path, dpi):
         is_macro   = net_edges["is_macro"]       # [P] bool
         first_pidx = net_edges["first_pin_idx"]  # [K]
 
-        # Absolute pin positions:
-        #   macro pin:  macro_center + pin_offset   (differentiable through positions)
-        #   port pin:   absolute (x, y) stored in offsets (macro_flag=0)
-        safe_ids  = macro_ids.clamp(min=0)
-        mflag     = is_macro.float().unsqueeze(1)
-        pin_pos   = positions[safe_ids] * mflag + offsets   # [P, 2]
+        safe_ids = macro_ids.clamp(min=0)
+        mflag    = is_macro.float().unsqueeze(1)
+        pin_pos  = positions[safe_ids] * mflag + offsets   # [P, 2]
 
-        # Star topology: first pin (driver) connects to every other pin in the net.
-        # first_pidx[k] = flat index of the first pin of net k.
+    # ── Net connections (drawn first, underneath macros) ──────────────────
+    if pin_pos is not None:
+        # Star topology: driver pin → every other pin in the net
         first_pos = pin_pos[first_pidx[net_ids_t]]          # [P, 2]
         is_first  = torch.zeros(len(net_ids_t), dtype=torch.bool)
         is_first[first_pidx] = True
@@ -152,34 +161,90 @@ def render_frame(frame_data, benchmark, net_edges, net_alpha, save_path, dpi):
 
         segs = np.stack(
             [first_pos[non_first].numpy(), pin_pos[non_first].numpy()],
-            axis=1
+            axis=1,
         )  # [S, 2, 2]
 
-        ax.add_collection(LineCollection(
-            segs, colors="black", alpha=net_alpha, linewidths=0.3, zorder=1
-        ))
+        if highlight_ids:
+            # A net is "highlighted" if any of its pins belongs to a highlighted macro.
+            pin_highlighted = torch.zeros(len(macro_ids), dtype=torch.bool)
+            for hid in highlight_ids:
+                pin_highlighted |= (macro_ids == hid)
+            # Per-net flag: True if any pin in that net is highlighted
+            net_highlighted = torch.zeros(net_edges["num_nets"], dtype=torch.float32)
+            net_highlighted.scatter_reduce_(
+                0, net_ids_t, pin_highlighted.float(),
+                reduce="amax", include_self=True,
+            )
+            net_highlighted = net_highlighted.bool()
+            # Map back to the non-first (edge) pins
+            nf_net_ids = net_ids_t[non_first]
+            edge_hi = net_highlighted[nf_net_ids].numpy()
+
+            ax.add_collection(LineCollection(
+                segs[~edge_hi], colors="black", alpha=net_alpha,
+                linewidths=0.3, zorder=1,
+            ))
+            if edge_hi.any():
+                ax.add_collection(LineCollection(
+                    segs[edge_hi], colors="crimson", alpha=0.95,
+                    linewidths=0.8, zorder=2,
+                ))
+        else:
+            ax.add_collection(LineCollection(
+                segs, colors="black", alpha=net_alpha, linewidths=0.3, zorder=1,
+            ))
 
     # ── Macro rectangles ──────────────────────────────────────────────────
     n = len(positions)
     for i in range(n):
         x, y = positions[i].tolist()
         w, h = macro_sizes[i].tolist()
-        is_soft  = i >= num_hard
-        is_fixed = benchmark.macro_fixed[i].item()
-        color      = "red" if is_fixed else "mediumseagreen" if is_soft else "steelblue"
-        rect_alpha = 0.25 if is_soft else 0.5
+        is_soft      = i >= num_hard
+        is_fixed     = benchmark.macro_fixed[i].item()
+        is_highlight = highlight_ids and (i in highlight_ids)
+        if is_highlight:
+            color      = "crimson"
+            rect_alpha = 0.85
+            lw         = 1.2
+        elif is_fixed:
+            color      = "red"
+            rect_alpha = 0.5
+            lw         = 0.3
+        elif is_soft:
+            color      = "mediumseagreen"
+            rect_alpha = 0.25
+            lw         = 0.3
+        else:
+            color      = "steelblue"
+            rect_alpha = 0.5
+            lw         = 0.3
         ax.add_patch(Rectangle(
             (x - w / 2, y - h / 2), w, h,
             facecolor=color, edgecolor="black",
-            alpha=rect_alpha, linewidth=0.3, zorder=2,
+            alpha=rect_alpha, linewidth=lw, zorder=3 if is_highlight else 2,
         ))
 
-    # ── I/O ports ─────────────────────────────────────────────────────────
+    # ── Macro pins (dots on macro faces) — only for highlighted macros ────
+    if pin_pos is not None and highlight_ids:
+        pin_on_highlight = torch.zeros(len(macro_ids), dtype=torch.bool)
+        for hid in highlight_ids:
+            pin_on_highlight |= (macro_ids == hid)
+        pin_on_highlight &= is_macro
+        if pin_on_highlight.any():
+            mp = pin_pos[pin_on_highlight].numpy()
+            ax.scatter(
+                mp[:, 0], mp[:, 1],
+                s=4, c="white", linewidths=0.5,
+                edgecolors="dimgray", zorder=4, marker="o",
+            )
+
+    # ── I/O ports (border pins) ────────────────────────────────────────────
     if benchmark.port_positions.shape[0] > 0:
         ax.scatter(
             benchmark.port_positions[:, 0].numpy(),
             benchmark.port_positions[:, 1].numpy(),
-            s=6, c="green", zorder=5,
+            s=10, c="limegreen", linewidths=0.5,
+            edgecolors="darkgreen", zorder=5, marker="D",
         )
 
     # ── Title with per-frame metadata ─────────────────────────────────────
@@ -192,8 +257,12 @@ def render_frame(frame_data, benchmark, net_edges, net_alpha, save_path, dpi):
         ovfw_str = "   ovfw=∞"
     else:
         ovfw_str = f"   ovfw={overflow:.3f}"
+    if label_override:
+        iter_str = label_override
+    else:
+        iter_str = f"iter {iteration:4d}"
     ax.set_title(
-        f"{name}{nets_label}  |  iter {iteration:4d}   "
+        f"{name}{nets_label}  |  {iter_str}   "
         f"WL={wl_loss:.1f}{ovfw_str}   γ={gamma:.4f}{alpha_label}{lambda_label}",
         fontsize=9,
     )
@@ -216,18 +285,6 @@ def main():
               file=sys.stderr)
         sys.exit(1)
 
-    frame_files = sorted(frames_root.glob("frame_*.pt"))
-    if not frame_files:
-        print(f"[error] No frame_*.pt files found in {frames_root}", file=sys.stderr)
-        sys.exit(1)
-
-    # Apply step subsampling
-    frame_files = frame_files[::args.step]
-    n_frames = len(frame_files)
-
-    output_path = Path(args.output) if args.output else Path(f"vis/{args.benchmark}_opt.gif")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
     # Load net topology (written once by the placer alongside the frames)
     net_edges = None
     if args.draw_nets:
@@ -239,30 +296,83 @@ def main():
             print("  Net edges : not found — nets will not be drawn")
             print("    (run placer with record_frames = true to generate net_edges.pt)")
 
-    print(f"  Benchmark : {args.benchmark}")
-    print(f"  Frames    : {n_frames}  (step={args.step})")
-    print(f"  FPS       : {args.fps}")
-    print(f"  Output    : {output_path}")
-    if net_edges is not None:
-        print(f"  Nets      : {net_edges['num_nets']}  alpha={args.net_alpha}")
-    print()
+    # Check for legalized frame
+    legal_frame_path = frames_root / "frame_legal.pt"
+    has_legal = legal_frame_path.exists()
+
+    output_path = Path(args.output) if args.output else Path(f"vis/{args.benchmark}_opt.gif")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Load the benchmark once (for macro_fixed, port_positions, etc.)
     print("  Loading benchmark...", end=" ", flush=True)
     benchmark = load_benchmark_for_frames(args.benchmark)
     print("done")
 
+    # Resolve --highlight names to benchmark macro indices
+    highlight_ids = set()
+    if args.highlight:
+        name_to_idx = {name: i for i, name in enumerate(benchmark.macro_names)}
+        for macro_name in args.highlight:
+            if macro_name in name_to_idx:
+                highlight_ids.add(name_to_idx[macro_name])
+            else:
+                print(f"  [warn] --highlight: macro '{macro_name}' not found, skipping")
+        if highlight_ids:
+            found = [benchmark.macro_names[i] for i in sorted(highlight_ids)]
+            print(f"  Highlight : {found}  (ids: {sorted(highlight_ids)})")
+
+    # --legal-only: render just the legalized PNG and exit
+    if args.legal_only:
+        if not has_legal:
+            print(f"[error] No frame_legal.pt found in {frames_root}", file=sys.stderr)
+            sys.exit(1)
+        legal_png_path = (Path(args.output) if args.output
+                          else Path(f"vis/{args.benchmark}_legal.png"))
+        legal_png_path.parent.mkdir(parents=True, exist_ok=True)
+        frame_data = torch.load(legal_frame_path, weights_only=False)
+        render_frame(frame_data, benchmark, net_edges, args.net_alpha,
+                     str(legal_png_path), dpi=150,
+                     highlight_ids=highlight_ids or None,
+                     label_override="LEGALIZED")
+        print(f"  Saved legalized image: {legal_png_path}")
+        return
+
+    frame_files = sorted(frames_root.glob("frame_*.pt"))
+    if not frame_files:
+        print(f"[error] No frame_*.pt files found in {frames_root}", file=sys.stderr)
+        sys.exit(1)
+
+    # Apply step subsampling
+    frame_files = frame_files[::args.step]
+    n_frames = len(frame_files)
+
+    print(f"  Benchmark : {args.benchmark}")
+    print(f"  Frames    : {n_frames}  (step={args.step})")
+    print(f"  FPS       : {args.fps}")
+    print(f"  Output    : {output_path}")
+    if net_edges is not None:
+        print(f"  Nets      : {net_edges['num_nets']}  alpha={args.net_alpha}")
+    if has_legal:
+        print(f"  Legal frame: {legal_frame_path}")
+    else:
+        print("  Legal frame: not found — legalized placement will not be appended")
+    print()
+
     # Render each frame to a temporary PNG, collect PIL Images
     pil_frames = []
+    frame_durations = []
+    duration_ms = int(1000 / args.fps)
     with tempfile.TemporaryDirectory() as tmpdir:
         for i, fpath in enumerate(frame_files):
             frame_data = torch.load(fpath, weights_only=False)
             png_path = Path(tmpdir) / f"frame_{i:05d}.png"
 
             render_frame(frame_data, benchmark, net_edges, args.net_alpha,
-                         str(png_path), args.dpi)
+                         str(png_path), args.dpi,
+                         highlight_ids=highlight_ids or None)
 
             pil_frames.append(Image.open(png_path).copy())  # copy before tmpdir cleanup
+            frame_durations.append(duration_ms)
 
             # Progress bar
             pct = (i + 1) / n_frames * 100
@@ -270,16 +380,36 @@ def main():
             print(f"\r  Rendering [{bar:<50}] {pct:5.1f}%  ({i+1}/{n_frames})",
                   end="", flush=True)
 
+        if has_legal:
+            frame_data = torch.load(legal_frame_path, weights_only=False)
+            frame_data["iter_label"] = "legal"
+            png_path = Path(tmpdir) / "frame_legal.png"
+            render_frame(frame_data, benchmark, net_edges, args.net_alpha,
+                         str(png_path), args.dpi,
+                         highlight_ids=highlight_ids or None,
+                         label_override="LEGALIZED")
+            pil_frames.append(Image.open(png_path).copy())
+            frame_durations.append(5000)  # 5-second pause on the final frame
+
+            # Save standalone high-res PNG of the legalized design
+            legal_png_path = output_path.with_name(
+                output_path.stem.replace("_opt", "") + "_legal.png"
+            )
+            render_frame(frame_data, benchmark, net_edges, args.net_alpha,
+                         str(legal_png_path), dpi=150,
+                         highlight_ids=highlight_ids or None,
+                         label_override="LEGALIZED")
+            print(f"\n  Saved legalized image: {legal_png_path}")
+
     print()  # newline after progress bar
 
     # Stitch into GIF with PIL
-    duration_ms = int(1000 / args.fps)
     print(f"  Writing GIF ({duration_ms}ms/frame)...", end=" ", flush=True)
     pil_frames[0].save(
         output_path,
         save_all=True,
         append_images=pil_frames[1:],
-        duration=duration_ms,
+        duration=frame_durations,
         loop=0,           # 0 = loop forever
         optimize=False,   # skip optimisation pass — much faster for large GIFs
     )

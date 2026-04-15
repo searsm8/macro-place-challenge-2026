@@ -1,0 +1,57 @@
+# MSPlacer configuration
+# Loaded automatically from the same directory as placer.py.
+# Any key omitted here falls back to the hardcoded default in placer.py.
+
+[params]
+initial_placement = "center" # "none" or "center"
+initial_spread    = 0.01     # fraction of canvas area used for initial random spread
+
+# ── Gradient descent ──────────────────────────────────────────────────────
+max_iters     = 2000  # upper bound; early stopping will usually fire before this
+seed          = 42
+
+# Smoothness of the WA HPWL approximation.
+# "auto" -> canvas_diag / 8.0 at runtime. Set a float to override.
+gamma         = "auto"
+gamma_decay   = 0.98    # multiply gamma by this each iteration
+gamma_min_frac = 0.00667 # gamma_min = canvas_diag * gamma_min_frac
+
+# Maximum distance any macro can move in one iteration.
+# "auto" -> canvas_diag * 0.005. Set a float to override.
+max_step      = "auto"
+
+# ── Convergence ───────────────────────────────────────────────────────────
+stop_overflow      = 0.1    # Lgamma: stop when overflow_ratio < this AND wl rising
+plateau_window     = 10     # Lsub: moving-average window for loss plateau detection
+plateau_threshold  = 0.001  # Lsub: stop when improvement < this fraction per window
+divergence_window  = 50     # stop if overflow rising AND wl > 5× best wl (last N iters)
+
+# ── Method selection ──────────────────────────────────────────────────────
+density_method        = "electrostatic"   # "bell" or "electrostatic"
+legalization          = "spiral"          # "none" or "spiral"
+use_preconditioner    = true              # divide gradient by (macro_area + net_degree)
+optimizer             = "bb_sgd"          # "sgd", "bb_sgd", or "nesterov"
+alpha_init            = "auto"            # initial step size for bb_sgd/nesterov
+
+# ── Lambda (density weight) schedule ──────────────────────────────────────
+lambda_schedule         = "hpwl"  # "hpwl" (feedback) or "geometric" (fixed ramp)
+
+# hpwl mode
+density_weight          = 8e-3
+lambda_pcof_upper       = 1.05
+lambda_pcof_lower       = 0.95
+
+# geometric mode
+density_weight_init     = 1e-5
+density_weight_max_step = 1.04
+
+# shared
+warmup_iters            = 20
+density_weight_max      = 5000
+target_density          = 0.5
+
+[output]
+log_every     = 50
+record_frames = true
+frames_dir    = "vis/frames"
+quiet         = false

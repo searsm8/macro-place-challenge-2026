@@ -68,6 +68,9 @@ logs/
 models/
 checkpoints/
 
+# Sweep run data (large .pt frame dumps)
+sweep/sweep_*/
+
 # Temporary files
 tmp/
 temp/

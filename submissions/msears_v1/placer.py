@@ -24,6 +24,7 @@ Usage:
     uv run evaluate submissions/msears/placer.py --vis
 """
 
+import os
 import sys
 import time
 import tomllib
@@ -49,6 +50,7 @@ def _import_sibling(name):
 
 _density   = _import_sibling("density")
 _legalizer = _import_sibling("legalizer")
+_output    = _import_sibling("output")
 
 
 # ---------------------------------------------------------------------------
@@ -61,13 +63,15 @@ def _load_config(path=None):
 
     Discovery order:
       1. Explicit path argument (if given)
-      2. config.toml in the same directory as placer.py  (default)
+      2. MSPLACER_CONFIG environment variable (used by sweep for parallelism)
+      3. config.toml in the same directory as placer.py  (default)
 
     Any key absent from the file falls back to the hardcoded default
     inside MSPlacer.__init__.
     """
     if path is None:
-        path = Path(__file__).parent / "config.toml"
+        env_path = os.environ.get("MSPLACER_CONFIG")
+        path = Path(env_path) if env_path else Path(__file__).parent / "config.toml"
     try:
         with open(path, "rb") as f:
             return tomllib.load(f)
@@ -338,7 +342,7 @@ class MSPlacer:
         self.lambda_pcof_lower    = p.get("lambda_pcof_lower", 0.95)
         # geometric mode params (kept for compat / ablation)
         self.density_weight_init     = p.get("density_weight_init", 1e-5)
-        self.density_weight_max_step = p.get("density_weight_max_step", 1.04)
+        self.density_weight_max_step = p.get("density_weight_max_step", 1.05)
         # shared
         self.warmup_iters         = p.get("warmup_iters", 50)
         # density_weight_max: hard safety cap. Without it, 1.05^1950 ≈ 10^41
@@ -360,67 +364,48 @@ class MSPlacer:
         #   Fire if overflow is rising AND WL > 2× best WL seen so far.
         self.divergence_window = p.get("divergence_window", 50)
 
-        # ── Output / logging ─────────────────────────────────────────────
-        self.log_every      = o.get("log_every", 50)
-        self.record_frames  = o.get("record_frames", False)
-        self.frames_dir     = o.get("frames_dir", "vis/frames")
-        self.quiet          = o.get("quiet", False)
+        # ── Initial placement ─────────────────────────────────────────────
+        # "none"   = keep benchmark initial positions
+        # "center" = randomize all macros near canvas center
+        self.initial_placement = p.get("initial_placement", "none")
+        self.initial_spread    = p.get("initial_spread", 0.01)  # fraction of canvas area
 
-    def _log(self, msg, **kwargs):
-        """Print unless quiet mode is on."""
-        if not self.quiet:
-            print(msg, **kwargs)
+        # ── Output / logging ─────────────────────────────────────────────
+        self._out = _output.OutputManager(o)
 
     def place(self, benchmark):
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
         t0 = time.time()
 
-        self._print_info(benchmark)
+        _output.print_benchmark_info(benchmark, self.density_method,
+                                      self.hpwl_gradient_method)
 
         plc = _load_plc(benchmark.name)
         if plc is None:
             print("  [warn] Could not load plc - returning initial placement", file=sys.stderr)
             return benchmark.macro_positions.clone()
 
-        self._log("  Building net data...", flush=True)
+        self._out.log("  Building net data...", flush=True)
         net_data = _build_net_data(benchmark, plc)
         if net_data is None:
             print("  [warn] No usable nets - returning initial placement", file=sys.stderr)
             return benchmark.macro_positions.clone()
-        self._log(f"  {net_data['num_nets']} nets, {net_data['num_pins']} pins  "
-                  f"({net_data['num_skipped']} nets skipped)")
+        self._out.log(f"  {net_data['num_nets']} nets, {net_data['num_pins']} pins  "
+                      f"({net_data['num_skipped']} nets skipped)")
 
         pos = self._gradient_place(benchmark, net_data)
 
         full_pos = benchmark.macro_positions.clone()
         full_pos[:benchmark.num_macros] = pos
 
-        self._log(f"  Total time: {time.time()-t0:.1f}s")
+        # Write per-macro HPWL diagnostic (hard macros only, sorted desc)
+        macro_dat = Path(self._out.frames_dir) / benchmark.name / "macros.dat"
+        _output.write_macro_dat(pos, benchmark, net_data, plc, macro_dat)
+        self._out.log(f"  Macro HPWL      -> {macro_dat}")
+
+        self._out.log(f"  Total time: {time.time()-t0:.1f}s")
         return full_pos
-
-    def _print_info(self, benchmark):
-        if self.quiet:
-            return
-        cw, ch = benchmark.canvas_width, benchmark.canvas_height
-        n = benchmark.num_macros
-        sizes = benchmark.macro_sizes[:n]
-        util = (sizes[:, 0] * sizes[:, 1]).sum() / (cw * ch) * 100
-
-        print(f"\n  Benchmark : {benchmark.name}")
-        print(f"  Macros    : {benchmark.num_hard_macros} hard + "
-              f"{benchmark.num_soft_macros} soft = {n} total  "
-              f"({int(benchmark.macro_fixed[:n].sum())} fixed)")
-        print(f"  Nets      : {benchmark.num_nets}   "
-              f"I/O ports: {benchmark.port_positions.shape[0]}")
-        print(f"  Canvas    : {cw:.2f} x {ch:.2f} um   "
-              f"Grid: {benchmark.grid_rows}r x {benchmark.grid_cols}c")
-        print(f"  Area util : {util:.1f}%   "
-              f"W:[{sizes[:,0].min():.3f}, {sizes[:,0].max():.3f}]  "
-              f"H:[{sizes[:,1].min():.3f}, {sizes[:,1].max():.3f}]")
-        print(f"  Density   : {self.density_method}  "
-              f"HPWL: {self.hpwl_gradient_method}")
-        print()
 
     def _gradient_place(self, benchmark, net_data):
         """
@@ -473,6 +458,24 @@ class MSPlacer:
             precond = None
 
         pos      = benchmark.macro_positions[:n].clone().float()
+
+        # ── Initial placement override ─────────────────────────────────────
+        if self.initial_placement == "center":
+            # Place all macros (including fixed) randomly within a small box
+            # centered on the canvas.  spread_r = sqrt(initial_spread) * canvas
+            # side gives a square with area = initial_spread * canvas_area.
+            spread_r = (self.initial_spread ** 0.5)
+            cx, cy   = cw / 2.0, ch / 2.0
+            half_bx  = cw * spread_r / 2.0
+            half_by  = ch * spread_r / 2.0
+            rand_pos = torch.zeros_like(pos)
+            rand_pos[:, 0] = torch.empty(n).uniform_(cx - half_bx, cx + half_bx)
+            rand_pos[:, 1] = torch.empty(n).uniform_(cy - half_by, cy + half_by)
+            # Clamp so each macro stays inside the canvas (accounting for half-sizes)
+            rand_pos[:, 0] = rand_pos[:, 0].clamp(half_w, cw - half_w)
+            rand_pos[:, 1] = rand_pos[:, 1].clamp(half_h, ch - half_h)
+            pos = rand_pos
+
         init_pos = pos.clone()
 
         lambda_d = 0.0  # density weight; stays 0 during warmup, then ramps
@@ -502,36 +505,13 @@ class MSPlacer:
         _alpha0 = self.alpha_init or max_step
         opt_info = (f"{self.optimizer}  alpha_init={_alpha0:.4f}  max_step={max_step:.4f}"
                     if self.optimizer != "sgd" else f"sgd  max_step={max_step:.4f}")
-        self._log(f"  Gradient descent: {self.max_iters} iters  "
-                  f"gamma0={gamma:.3f}  gamma_min={gamma_min:.4f}  "
-                  f"warmup={self.warmup_iters}  stop_overflow={self.stop_overflow}  "
-                  f"optimizer={opt_info}")
+        self._out.log(f"  Gradient descent: {self.max_iters} iters  "
+                      f"gamma0={gamma:.3f}  gamma_min={gamma_min:.4f}  "
+                      f"warmup={self.warmup_iters}  stop_overflow={self.stop_overflow}  "
+                      f"optimizer={opt_info}")
 
-        # Prepare frame export directory (cleared fresh each run)
-        if self.record_frames:
-            frames_dir = Path(self.frames_dir) / benchmark.name
-            if frames_dir.exists():
-                for f in frames_dir.glob("frame_*.pt"):
-                    f.unlink()
-            frames_dir.mkdir(parents=True, exist_ok=True)
-            self._log(f"  Recording frames -> {frames_dir}/")
-
-            # Save net topology once (topology doesn't change between iterations).
-            K = net_data["num_nets"]
-            net_ids_t = net_data["net_ids"]
-            _, counts = torch.unique_consecutive(net_ids_t, return_counts=True)
-            first_pin_idx = torch.zeros(K, dtype=torch.long)
-            if K > 1:
-                first_pin_idx[1:] = counts[:-1].cumsum(0)
-            torch.save({
-                "macro_ids":     net_data["macro_ids"],
-                "offsets":       net_data["offsets"],
-                "net_ids":       net_ids_t,
-                "is_macro":      net_data["is_macro"],
-                "num_nets":      K,
-                "first_pin_idx": first_pin_idx,
-            }, frames_dir / "net_edges.pt")
-            self._log(f"  Net topology    -> {frames_dir}/net_edges.pt")
+        self._out.setup_frames(benchmark, net_data)
+        self._out.open_iter_log(benchmark)
 
         for t in range(self.max_iters):
 
@@ -650,8 +630,8 @@ class MSPlacer:
 
                 # NaN safety: restore from best snapshot if positions blow up
                 if torch.isnan(pos).any():
-                    self._log(f"  [NaN]       iter {t}: positions contain NaN, "
-                              f"restoring best snapshot and stopping")
+                    self._out.log(f"  [NaN]       iter {t}: positions contain NaN, "
+                                  f"restoring best snapshot and stopping")
                     pos = best_pos.clone()
                     if self.optimizer == "nesterov":
                         u_k = pos.clone()
@@ -707,10 +687,12 @@ class MSPlacer:
             # Decay gamma: sharpen WA approximation toward exact HPWL
             gamma = max(gamma * self.gamma_decay, gamma_min)
 
-            if self.log_every > 0 and (t % self.log_every == 0 or t == self.max_iters - 1):
-                self._log(f"    iter {t:4d}  wl={wl_val:.4f}  "
-                          f"den={den_energy:.4f}  ovf={overflow:.4f}  "
-                          f"λ={lambda_d:.2e}  gamma={gamma:.4f}")
+            self._out.write_iter(t, wl_val, overflow, alpha, lambda_d, gamma)
+
+            if self._out.should_log(t, self.max_iters):
+                self._out.log(f"    iter {t:4d}  wl={wl_val:.4f}  "
+                              f"den={den_energy:.4f}  ovf={overflow:.4f}  "
+                              f"λ={lambda_d:.2e}  gamma={gamma:.4f}")
 
             # ── Convergence checks (post-warmup only) ─────────────────────
             if t >= self.warmup_iters and t > 100:
@@ -719,15 +701,15 @@ class MSPlacer:
                 #    Density has converged (overflow below threshold) AND WL has
                 #    started rising — the optimal WL/density trade-off is reached.
                 if overflow < self.stop_overflow and wl_val > prev_wl:
-                    self._log(f"  [converged] iter {t}: overflow {overflow:.4f} "
-                              f"< {self.stop_overflow} and wl rising")
+                    self._out.log(f"  [converged] iter {t}: overflow {overflow:.4f} "
+                                  f"< {self.stop_overflow} and wl rising")
                     break
 
                 # b) Max-density criterion: every bin is already under target —
                 #    no further spreading needed.
                 if max_den < self.target_density:
-                    self._log(f"  [converged] iter {t}: max_density {max_den:.4f} "
-                              f"< target {self.target_density}")
+                    self._out.log(f"  [converged] iter {t}: max_density {max_den:.4f} "
+                                  f"< target {self.target_density}")
                     break
 
                 # c) Lsub plateau criterion (DREAMplace ~line 355-372):
@@ -747,9 +729,9 @@ class MSPlacer:
                     # convergence where loss stops moving).
                     rel_change = abs(cur_avg - prev_avg) / (prev_avg + 1e-12)
                     if rel_change < self.plateau_threshold:
-                        self._log(f"  [plateau]   iter {t}: loss avg flat "
-                                  f"{cur_avg:.4f} ≈ {prev_avg:.4f} "
-                                  f"(rel={rel_change:.4f})")
+                        self._out.log(f"  [plateau]   iter {t}: loss avg flat "
+                                      f"{cur_avg:.4f} ≈ {prev_avg:.4f} "
+                                      f"(rel={rel_change:.4f})")
                         break
 
                 # d) Divergence detection: overflow has been RISING for the
@@ -764,9 +746,9 @@ class MSPlacer:
                     oh = overflow_history[-dw:]
                     trend = (oh[-1] - oh[0]) / (oh[0] + 1e-12)
                     if trend > 0.02:
-                        self._log(f"  [diverged]  iter {t}: wl {wl_val:.4f} > "
-                                  f"5×best {best_wl:.4f}, ovf +{trend*100:.1f}% "
-                                  f"over {dw} iters; stopping (keeping current pos)")
+                        self._out.log(f"  [diverged]  iter {t}: wl {wl_val:.4f} > "
+                                      f"5×best {best_wl:.4f}, ovf +{trend*100:.1f}% "
+                                      f"over {dw} iters; stopping (keeping current pos)")
                         # Do NOT restore best_pos — the current spread position is
                         # almost always better than the pre-warmup best snapshot.
                         break
@@ -774,26 +756,15 @@ class MSPlacer:
             prev_wl       = wl_val
             prev_overflow = overflow
 
-            # Export frame snapshot for animation
-            if self.record_frames:
-                torch.save({
-                    "iter":      t,
-                    "positions": pos.detach().clone(),   # [n, 2] macro centers
-                    "wl_loss":   wl_val,
-                    "den_loss":  den_energy,
-                    "overflow":  overflow,
-                    "lambda_d":  lambda_d,
-                    "alpha":     alpha,
-                    "gamma":     gamma,
-                    "benchmark_name": benchmark.name,
-                    "canvas_width":   cw,
-                    "canvas_height":  ch,
-                    "macro_sizes":    benchmark.macro_sizes[:n].clone(),
-                    "num_hard":       benchmark.num_hard_macros,
-                }, frames_dir / f"frame_{t:05d}.pt")
+            self._out.save_frame(t, pos, wl_val, den_energy, overflow,
+                                 lambda_d, alpha, gamma, benchmark, n)
+
+        self._out.close()
 
         if self.legalization == "spiral":
-            self._log("  Legalizing (spiral push-out)...")
+            self._out.log("  Legalizing (spiral push-out)...")
             pos = _legalizer.spiral_legalize(pos, benchmark)
+            self._out.save_frame(t, pos, wl_val, den_energy, overflow,
+                                 lambda_d, alpha, gamma, benchmark, n)
 
         return pos

@@ -3,6 +3,9 @@
 # Any key omitted here falls back to the hardcoded default in placer.py.
 
 [params]
+initial_placement = "center" # "none" or "center"
+initial_spread    = 0.01   # fraction of canvas area used for initial random spread
+
 # ── Gradient descent ──────────────────────────────────────────────────────
 max_iters     = 2000  # upper bound; early stopping will usually fire before this
 seed          = 42
@@ -37,7 +40,7 @@ lambda_schedule         = "hpwl"  # "hpwl" (feedback) or "geometric" (old fixed 
 # hpwl mode — DREAMplace RePlAce-style feedback
 # λ_init = density_weight × ‖wl_grad‖₁ / ‖den_grad‖₁  (auto-scaled per benchmark)
 # λ *= mu each iter, where mu ∈ [pcof_lower, pcof_upper] based on ΔHPWL
-density_weight          = 8e-5   # scale factor for auto-init
+density_weight          = 8e-4   # scale factor for auto-init
 lambda_pcof_upper       = 1.05   # max per-step multiplier (WL decreasing)
 lambda_pcof_lower       = 0.95   # min per-step multiplier (λ can decrease when WL rising fast)
 
@@ -47,8 +50,8 @@ density_weight_max_step = 1.04   # fixed ramp multiplier (geometric only)
 
 # shared
 warmup_iters            = 20     # WL-only iterations before density activates
-density_weight_max      = 100.0  # hard safety cap on λ (both modes)
-target_density          = 0.65   # target area utilization per grid cell
+density_weight_max      = 5000.0  # hard safety cap on λ (both modes)
+target_density          = 0.5    # target area utilization per grid cell
 
 [output]
 log_every     = 50      # print WL loss every N iterations (0 = silent loop)
