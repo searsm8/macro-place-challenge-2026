@@ -329,6 +329,10 @@ class MSPlacer:
         self.warmup_iters = p.get("warmup_iters", 20)
         self.density_weight_max = p.get("density_weight_max", 5000.0)
         self.target_density = p.get("target_density", 0.5)
+        # Hard-macro density boost: multiplies density gradient for hard macros
+        # only, starts at lambda_hm_init and decays toward 1.0 each iteration.
+        self.lambda_hm_init = p.get("lambda_hm_init", 3.0)
+        self.lambda_hm_decay = p.get("lambda_hm_decay", 0.995)
 
     def _readConvergenceParams(self, p):
         self.stop_overflow = p.get("stop_overflow", 0.1)
@@ -446,6 +450,8 @@ class MSPlacer:
             "pos": pos,
             "init_pos": init_pos,
             "lambda_d": 0.0,
+            "lambda_hm": self.lambda_hm_init,
+            "hard_mask": benchmark.get_hard_macro_mask(),
             "best_wl": float("inf"),
             "best_pos": pos.clone(),
             "prev_wl": float("inf"),
@@ -543,6 +549,9 @@ class MSPlacer:
         self._trackBestWl(wl_val, state)
         self._updateLambda(t, wl_val, wl_grad, den_grad, den_energy, state)
         state["gamma"] = max(state["gamma"] * self.gamma_decay, state["gamma_min"])
+        # Decay hard-macro density boost toward 1.0
+        if state["lambda_hm"] > 1.0:
+            state["lambda_hm"] = max(1.0, state["lambda_hm"] * self.lambda_hm_decay)
 
         self._out.writeIter(t, wl_val, overflow, alpha, state["lambda_d"],
                             state["gamma"])
@@ -584,8 +593,15 @@ class MSPlacer:
         return (torch.zeros_like(state["pos"]), 0.0, float("inf"), float("inf"))
 
     def _combineGradients(self, wl_grad, den_grad, state):
-        """Combine WL and density gradients, apply preconditioner."""
-        grad = wl_grad + state["lambda_d"] * den_grad
+        """Combine WL and density gradients, apply preconditioner.
+
+        Hard macros get an extra multiplier (lambda_hm) on their density
+        gradient so they spread out before soft macros.
+        """
+        scaled_den = den_grad.clone()
+        if state["lambda_hm"] > 1.0:
+            scaled_den[state["hard_mask"]] *= state["lambda_hm"]
+        grad = wl_grad + state["lambda_d"] * scaled_den
         if state["precond"] is not None:
             grad = grad / state["precond"]
         return grad

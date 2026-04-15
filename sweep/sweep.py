@@ -32,8 +32,9 @@ Usage
 SWEEP = {
     #"target_density": [0.50, 0.80],
     #"lambda_pcof_upper": [1.03, 1.04, 1.05, 1.06],
-    # "density_weight": [8e-3, 1.6e-2],
-    "initial_spread": [0.01, 0.04, 0.15],
+    #"density_weight": [8e-3, 1.6e-2],
+    #"initial_spread": [0.01, 0.04, 0.15],
+    "lambda_hm_init": [3, 10, 30, 90, 270],
 
     # "warmup_iters": [10, 20, 40],
     #"optimizer": ["sgd", "bb_sgd", "nesterov"],
@@ -58,7 +59,7 @@ from pathlib import Path
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 REPO_ROOT   = Path(__file__).parent.parent
-SUBMISSION_DIR = REPO_ROOT / "submissions/claude"
+SUBMISSION_DIR = REPO_ROOT / "submissions/msears_v2"
 CONFIG_PATH = REPO_ROOT / SUBMISSION_DIR / "config.toml"
 SWEEP_DIR   = Path(__file__).parent          # …/sweep/
 MASTER_CSV  = SWEEP_DIR / "results.csv"
