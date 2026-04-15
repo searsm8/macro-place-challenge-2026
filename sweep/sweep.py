@@ -1,5 +1,5 @@
 """
-sweep/sweep.py — Parallel hyperparameter sweep for MSPlacer.
+sweep/sweep.py — Parallel hyperparameter sweep for CometPlacer.
 
 Each (config combo × benchmark) is an independent job dispatched to a thread
 pool. Results are saved per-run and collated into sweep/results.csv.
@@ -34,32 +34,27 @@ SWEEP = {
     #"lambda_pcof_upper": [1.03, 1.04, 1.05, 1.06],
     #"density_weight": [8e-3, 1.6e-2],
     #"initial_spread": [0.01, 0.04, 0.15],
-    "lambda_hm_init": [3, 10, 30, 90, 270],
-
+    #"lambda_hm_init": [1, 2, 3, 20],
     # "warmup_iters": [10, 20, 40],
     #"optimizer": ["sgd", "bb_sgd", "nesterov"],
 }
 # ─────────────────────────────────────────────────────────────────────────────
 
 import argparse
-import concurrent.futures
 import csv
 import itertools
 import os
 import re
-import shutil
 import subprocess
 import sys
-import threading
 import time
-import tomllib
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 REPO_ROOT   = Path(__file__).parent.parent
-SUBMISSION_DIR = REPO_ROOT / "submissions/msears_v2"
+SUBMISSION_DIR = REPO_ROOT / "submissions/msears"
 CONFIG_PATH = REPO_ROOT / SUBMISSION_DIR / "config.toml"
 SWEEP_DIR   = Path(__file__).parent          # …/sweep/
 MASTER_CSV  = SWEEP_DIR / "results.csv"
@@ -67,18 +62,10 @@ UV          = "/home/msears/.local/bin/uv"
 
 IBM_BENCHMARKS = [
     "ibm01", "ibm02", "ibm03", "ibm04", "ibm06", "ibm07", "ibm08", "ibm09",
-    "ibm10", "ibm11", "ibm12", "ibm13", "ibm14", "ibm15", "ibm16", "ibm17",
-    "ibm18",
+    "ibm10", "ibm11", "ibm12", "ibm13", "ibm14", "ibm15", "ibm16", "ibm17", "ibm18",
 ]
 
-METRIC_COLS = ["proxy", "wl", "den", "cong", "valid", "time_s", "overlaps"]
-
-_print_lock = threading.Lock()
-
-
-def safe_print(*args, **kwargs):
-    with _print_lock:
-        print(*args, **kwargs)
+METRIC_COLS = ["proxy", "wl", "den", "cong", "valid", "time_s", "iters", "overlaps"]
 
 
 # ── Config helpers ─────────────────────────────────────────────────────────────
@@ -102,7 +89,7 @@ def patch_config(original_text: str, params: dict) -> str:
         tval     = toml_value(val)
         new_text, n = re.subn(pattern, rf"\g<1>{tval}", text)
         if n == 0:
-            safe_print(
+            print(
                 f"  [warn] key '{key}' not found in config.toml — skipping",
                 file=sys.stderr,
             )
@@ -128,6 +115,7 @@ def parse_result(stdout: str, benchmark: str) -> dict | None:
         "cong":      None,
         "valid":     None,
         "time_s":    None,
+        "iters":     None,
         "overlaps":  None,
     }
 
@@ -151,6 +139,11 @@ def parse_result(stdout: str, benchmark: str) -> dict | None:
         if m2:
             result["overlaps"] = int(m2.group(1))
 
+        # Iteration count: "  iters=500"
+        m3 = re.search(r"\biters=(\d+)", line)
+        if m3:
+            result["iters"] = int(m3.group(1))
+
     if result["proxy"] is None:
         return None
 
@@ -167,7 +160,6 @@ def write_run_summary(
     benchmark: str,
     combo_id: int,
     sweep_params: dict,
-    cfg_params: dict,
     result: dict | None,
 ):
     lines = [
@@ -190,12 +182,6 @@ def write_run_summary(
         ]
     else:
         lines.append("## Results\n\n**FAILED — no output parsed.**\n")
-
-    lines += [
-        "\n## Full config params\n\n```toml\n",
-        *[f"{k} = {toml_value(v)}\n" for k, v in cfg_params.items()],
-        "```\n",
-    ]
 
     path.write_text("".join(lines))
 
@@ -291,14 +277,13 @@ def run_one(
     elapsed = time.perf_counter() - t0
 
     if not quiet:
-        safe_print(stdout, end="")
+        print(stdout, end="")
 
-    result     = parse_result(stdout, benchmark)
-    cfg_params = tomllib.loads(patched).get("params", {})
+    result = parse_result(stdout, benchmark)
 
     write_run_summary(
         run_dir / "run_summary.md",
-        benchmark, combo_id, sweep_params, cfg_params, result,
+        benchmark, combo_id, sweep_params, result,
     )
 
     label = "  ".join(f"{k}={v}" for k, v in sweep_params.items())
@@ -309,7 +294,7 @@ def run_one(
         )
     else:
         status = f"[FAILED]  ({elapsed:.1f}s)"
-    safe_print(f"  [{combo_id:03d}] {benchmark:<8}  {label}  →  {status}")
+    print(f"  [{combo_id:03d}] {benchmark:<8}  {label}  →  {status}")
 
     # Render GIF if frames were recorded
     if record_frames and render_gifs:
@@ -324,7 +309,7 @@ def run_one(
         ]
         subprocess.run(gif_cmd, capture_output=True, cwd=str(REPO_ROOT))
         if gif_path.exists():
-            safe_print(f"  [{combo_id:03d}] {benchmark:<8}  GIF → {gif_path.relative_to(REPO_ROOT)}")
+            print(f"  [{combo_id:03d}] {benchmark:<8}  GIF → {gif_path.relative_to(REPO_ROOT)}")
 
     return result
 
@@ -339,8 +324,6 @@ def parse_args():
                    help="Run all 17 IBM benchmarks (default: ibm01)")
     p.add_argument("--benchmark", "-b", default=None,
                    help="Run a specific benchmark (e.g. ibm03)")
-    p.add_argument("--workers", type=int, default=8,
-                   help="Parallel worker threads (default: 8)")
     p.add_argument("--quiet", action="store_true",
                    help="Suppress per-run evaluator stdout")
     p.add_argument("--no-record-frames", dest="record_frames", action="store_false", default=True,
@@ -377,7 +360,6 @@ def main():
 
     n_jobs = n_combos * len(benchmarks)
     print(f"Sweep : {n_combos} combo(s) × {len(benchmarks)} benchmark(s) = {n_jobs} jobs")
-    print(f"Workers: {args.workers}")
     print(f"Output : {sweep_run_dir.relative_to(REPO_ROOT)}")
     print(f"Master : {MASTER_CSV.relative_to(REPO_ROOT)}")
     print()
@@ -390,32 +372,24 @@ def main():
             run_dir = sweep_run_dir / benchmark / f"run_{combo_id:03d}"
             jobs.append((run_dir, benchmark, combo_id, params))
 
-    # ── Execute in parallel ───────────────────────────────────────────────────
+    # ── Execute serially ──────────────────────────────────────────────────────
     collected: list[tuple[int, dict, dict]] = []   # (combo_id, params, result)
-    futures_map: dict = {}
 
     record_frames = args.record_frames
     render_gifs   = args.render_gifs
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
-        for run_dir, benchmark, combo_id, params in jobs:
-            fut = pool.submit(
-                run_one,
+    for run_dir, benchmark, combo_id, params in jobs:
+        try:
+            result = run_one(
                 run_dir, benchmark, combo_id, params,
                 original_config, args.quiet,
                 record_frames, render_gifs,
             )
-            futures_map[fut] = (combo_id, params, benchmark)
-
-        for fut in concurrent.futures.as_completed(futures_map):
-            combo_id, params, benchmark = futures_map[fut]
-            try:
-                result = fut.result()
-            except Exception as exc:
-                safe_print(f"  [ERROR] combo={combo_id:03d} {benchmark}: {exc}")
-                result = None
-            if result:
-                collected.append((combo_id, params, result))
+        except Exception as exc:
+            print(f"  [ERROR] combo={combo_id:03d} {benchmark}: {exc}")
+            result = None
+        if result:
+            collected.append((combo_id, params, result))
 
     # ── Write CSVs ────────────────────────────────────────────────────────────
     csv_rows = [

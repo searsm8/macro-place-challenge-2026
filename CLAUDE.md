@@ -28,7 +28,7 @@ wsl -e bash -c "cd /home/msears/phd/macro-place-challenge-2026 && /home/msears/.
 ### Key files
 | File | Purpose |
 |------|---------|
-| `submissions/msears/placer.py` | Main placer — MSPlacer class |
+| `submissions/msears/placer.py` | Main placer — CometPlacer class |
 | `submissions/msears/density.py` | Density spreading forces (bell + electrostatic) |
 | `submissions/msears/config.toml` | Hyperparameter config (TOML, auto-discovered) |
 | `scripts/frames_to_gif.py` | Offline GIF renderer from saved frame snapshots |
@@ -43,8 +43,8 @@ wsl -e bash -c "cd /home/msears/phd/macro-place-challenge-2026 && /home/msears/.
   - `is_macro [P]` — bool mask distinguishing macro pins from port pins
 - **`_wa_hpwl(pos, net_data, gamma)`** — vectorized smooth WA HPWL via scatter_add
 - **`_density.compute_density_gradient(method, pos, benchmark, target_density)`** — density spreading force dispatcher (from `density.py`)
-- **`MSPlacer.place(benchmark)`** — main entry point called by contest harness
-- **`MSPlacer._gradient_place(benchmark, net_data)`** — gradient descent loop
+- **`CometPlacer.place(benchmark)`** — main entry point called by contest harness
+- **`CometPlacer._gradient_place(benchmark, net_data)`** — gradient descent loop
 
 ### Algorithm (current state)
 WA HPWL + electrostatic density gradient descent, inspired by DREAMplace (Lin et al.

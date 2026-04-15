@@ -1,5 +1,5 @@
 """
-output.py — Output utilities for MSPlacer.
+output.py — Output utilities for CometPlacer.
 
 Console logging, frame export, iteration CSV log, and per-macro HPWL table.
 """

@@ -1,5 +1,5 @@
 """
-density.py — Density spreading forces for MSPlacer.
+density.py — Density spreading forces for CometPlacer.
 
 Two methods, selected by density_method in config.toml:
 

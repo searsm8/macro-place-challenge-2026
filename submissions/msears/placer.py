@@ -1,5 +1,5 @@
 """
-MSPlacer — Analytical WA HPWL + Density Gradient Descent
+CometPlacer — Analytical WA HPWL + Density Gradient Descent
 
 A PyTorch-based analytical placer inspired by DREAMplace (Lin et al. DAC 2019)
 and ePlace (Lu et al. DAC 2015).
@@ -283,7 +283,7 @@ def _waSpanForAxis(u, net_ids, num_nets, gamma):
 # Placer class
 # ---------------------------------------------------------------------------
 
-class MSPlacer:
+class CometPlacer:
     """
     Analytical placer using vectorized WA HPWL + density gradient descent.
 
@@ -404,6 +404,7 @@ class MSPlacer:
             if should_stop:
                 break
 
+        print(f"  iters={t + 1}")
         self._out.close()
 
         if self.legalization == "spiral":

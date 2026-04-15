@@ -1,9 +1,9 @@
 """
-frames_to_gif.py — Convert MSPlacer frame snapshots into an animated GIF.
+frames_to_gif.py — Convert CometPlacer frame snapshots into an animated GIF.
 
-Loads the per-iteration .pt files written by MSPlacer when record_frames=true
+Loads the per-iteration .pt files written by CometPlacer when record_frames=true
 and stitches them into a GIF.  If net_edges.pt is present in the same directory
-(also written by MSPlacer), net connections are drawn as a gray LineCollection
+(also written by CometPlacer), net connections are drawn as a gray LineCollection
 on each frame — no PlacementCost (plc) object is needed, so rendering stays fast.
 
 Each frame is rendered as a single-panel matplotlib figure showing:
@@ -39,7 +39,7 @@ from PIL import Image
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Convert MSPlacer frame snapshots to GIF.")
+    p = argparse.ArgumentParser(description="Convert CometPlacer frame snapshots to GIF.")
     p.add_argument("--benchmark", "-b", default="ibm01",
                    help="Benchmark name (default: ibm01)")
     p.add_argument("--frames-dir", default="vis/frames",

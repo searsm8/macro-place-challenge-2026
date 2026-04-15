@@ -1,5 +1,5 @@
 """
-legalizer.py — Post-placement legalization for MSPlacer.
+legalizer.py — Post-placement legalization for CometPlacer.
 
 Public API:
     spiralLegalize(pos, benchmark) -> torch.Tensor
