@@ -30,6 +30,8 @@ wsl -e bash -c "cd /home/msears/phd/macro-place-challenge-2026 && /home/msears/.
 |------|---------|
 | `submissions/msears/placer.py` | Main placer — CometPlacer class |
 | `submissions/msears/density.py` | Density spreading forces (bell + electrostatic) |
+| `submissions/msears/legalizer.py` | Spiral push-out legalization (spiralLegalize) |
+| `submissions/msears/output.py` | OutputManager: logging, frame recording |
 | `submissions/msears/config.toml` | Hyperparameter config (TOML, auto-discovered) |
 | `scripts/frames_to_gif.py` | Offline GIF renderer from saved frame snapshots |
 
@@ -44,7 +46,7 @@ wsl -e bash -c "cd /home/msears/phd/macro-place-challenge-2026 && /home/msears/.
 - **`_wa_hpwl(pos, net_data, gamma)`** — vectorized smooth WA HPWL via scatter_add
 - **`_density.compute_density_gradient(method, pos, benchmark, target_density)`** — density spreading force dispatcher (from `density.py`)
 - **`CometPlacer.place(benchmark)`** — main entry point called by contest harness
-- **`CometPlacer._gradient_place(benchmark, net_data)`** — gradient descent loop
+- **`CometPlacer._gradient_place(benchmark, net_data)`** — gradient descent loop; calls `spiralLegalize` post-loop when `legalization = "spiral"` in config, then saves `frame_legal.pt` via `OutputManager.saveLegalFrame()`
 
 ### Algorithm (current state)
 WA HPWL + electrostatic density gradient descent, inspired by DREAMplace (Lin et al.
@@ -208,6 +210,5 @@ Avoids external DCT libraries. Spectral constants cached per grid shape.
 **Sign convention:** the potential φ has a maximum at density peaks (∇²φ=ρ with Neumann BCs). The repulsive spreading gradient is `den_grad = -E = +∇φ`, so `_density_gradient_electrostatic` returns `(-Ex, -Ey)` from the Poisson solver.
 
 ### NOT yet implemented
-- Legalization (overlap removal via spiral search)
 - Nesterov momentum + BB step size
 - Genetic algorithm over macro orientations

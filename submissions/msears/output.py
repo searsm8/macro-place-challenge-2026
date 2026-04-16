@@ -154,7 +154,7 @@ class OutputManager:
         """Open iterations.dat for writing per-iteration metrics."""
         if not self.record_iters:
             return
-        iter_path = Path(self.frames_dir) / benchmark.name / "iterations.dat"
+        iter_path = Path(self.frames_dir).parent / "data" / benchmark.name / "iterations.dat"
         iter_path.parent.mkdir(parents=True, exist_ok=True)
         self._iter_fh = open(iter_path, "w")
         self._iter_fh.write("Iter, HPWL, OVFW, alpha, lambda, gamma\n")
@@ -192,6 +192,46 @@ class OutputManager:
             "macro_sizes": benchmark.macro_sizes[:num_macros].clone(),
             "num_hard": benchmark.num_hard_macros,
         }, self._bench_frames_dir / f"frame_{iter_num:05d}.pt")
+
+    def saveMipFrame(self, pos, benchmark, num_macros):
+        """Save the quadratic-init (mIP) placement as frame_mip.pt."""
+        if not self.record_frames or self._bench_frames_dir is None:
+            return
+        torch.save({
+            "iter": -1,
+            "positions": pos.detach().clone(),
+            "wl_loss": 0.0,
+            "den_loss": 0.0,
+            "overflow": float("inf"),
+            "lambda_d": 0.0,
+            "alpha": 0.0,
+            "gamma": 0.0,
+            "benchmark_name": benchmark.name,
+            "canvas_width": float(benchmark.canvas_width),
+            "canvas_height": float(benchmark.canvas_height),
+            "macro_sizes": benchmark.macro_sizes[:num_macros].clone(),
+            "num_hard": benchmark.num_hard_macros,
+        }, self._bench_frames_dir / "frame_mip.pt")
+
+    def saveLegalFrame(self, iter_num, pos, wl_val, gamma, benchmark, num_macros):
+        """Save the legalized placement as frame_legal.pt."""
+        if not self.record_frames or self._bench_frames_dir is None:
+            return
+        torch.save({
+            "iter": iter_num,
+            "positions": pos.detach().clone(),
+            "wl_loss": wl_val,
+            "den_loss": 0.0,
+            "overflow": 0.0,
+            "lambda_d": 0.0,
+            "alpha": 0.0,
+            "gamma": gamma,
+            "benchmark_name": benchmark.name,
+            "canvas_width": float(benchmark.canvas_width),
+            "canvas_height": float(benchmark.canvas_height),
+            "macro_sizes": benchmark.macro_sizes[:num_macros].clone(),
+            "num_hard": benchmark.num_hard_macros,
+        }, self._bench_frames_dir / "frame_legal.pt")
 
     def close(self):
         """Close the iteration log file."""

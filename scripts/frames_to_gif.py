@@ -38,6 +38,69 @@ import torch
 from PIL import Image
 
 
+def _load_visualizer_config():
+    """
+    Read highlight settings from submissions/msears/config.toml.
+    Returns (highlight_macros: list[str], highlight_random_macros: int).
+    Falls back to ([], 0) if the key / file is absent.
+    """
+    import tomllib
+    repo_root = Path(__file__).resolve().parent.parent
+    cfg_path = repo_root / "submissions" / "msears" / "config.toml"
+    if not cfg_path.exists():
+        return [], 0
+    with open(cfg_path, "rb") as f:
+        cfg = tomllib.load(f)
+    out = cfg.get("output", {})
+    names   = list(out.get("highlight_macros", []))
+    n_rand  = int(out.get("highlight_random_macros", 0))
+    return names, n_rand
+
+
+def _sample_highlight_ids(benchmark, n):
+    """
+    Return a set of n macro indices sampled without replacement, weighted by
+    macro area (w × h).  Fixed macros are excluded from sampling.
+    """
+    import random
+    sizes = benchmark.macro_sizes          # [N, 2] tensor
+    fixed = benchmark.macro_fixed          # [N] bool tensor
+    areas = (sizes[:, 0] * sizes[:, 1]).tolist()
+    candidates = [i for i, f in enumerate(fixed.tolist()) if not f]
+    weights    = [areas[i] for i in candidates]
+    k = min(n, len(candidates))
+    chosen = random.choices(candidates, weights=weights, k=k * 10)  # oversample, dedup
+    seen, result = set(), []
+    for idx in chosen:
+        if idx not in seen:
+            seen.add(idx)
+            result.append(idx)
+        if len(result) == k:
+            break
+    return set(result)
+
+
+def _annotate_macros_dat(dat_path, highlight_names):
+    """
+    Rewrite macros.dat in-place, appending '*' to the name of each highlighted
+    macro.  Idempotent: existing '*' markers are stripped first so re-running
+    doesn't keep adding them.
+    """
+    lines = dat_path.read_text().splitlines()
+    out = []
+    for line in lines:
+        # Header / separator lines pass through unchanged
+        if not line or line.startswith("-") or line.startswith("macro_name"):
+            out.append(line)
+            continue
+        # Name occupies the first 40 characters (left-aligned, space-padded)
+        raw_name = line[:40].rstrip().rstrip("*")  # strip any prior '*'
+        rest     = line[40:]
+        marker   = "*" if raw_name in highlight_names else " "
+        out.append(f"{raw_name + marker:<40}{rest}")
+    dat_path.write_text("\n".join(out) + "\n")
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Convert CometPlacer frame snapshots to GIF.")
     p.add_argument("--benchmark", "-b", default="ibm01",
@@ -61,8 +124,13 @@ def parse_args():
     p.add_argument("--highlight", nargs="+", default=[], metavar="MACRO_NAME",
                    help="Macro names whose nets are drawn at alpha=0.95 "
                         "(e.g. --highlight macro_0 macro_3)")
+    p.add_argument("--highlight-random", type=int, default=None, metavar="N",
+                   help="Randomly highlight N macros, weighted by area (overrides "
+                        "highlight_random_macros from config.toml). 0 = disabled.")
     p.add_argument("--legal-only", action="store_true", default=False,
                    help="Only render the legalized frame as a PNG (skip GIF)")
+    p.add_argument("--mip-only", action="store_true", default=False,
+                   help="Only render the quadratic-init (mIP) frame as a PNG (skip GIF)")
     return p.parse_args()
 
 
@@ -308,18 +376,58 @@ def main():
     benchmark = load_benchmark_for_frames(args.benchmark)
     print("done")
 
-    # Resolve --highlight names to benchmark macro indices
+    # Resolve highlight macro names → indices.
+    # Priority: --highlight CLI > highlight_macros config > random sampling.
+    cfg_names, cfg_n_random = _load_visualizer_config()
+    name_to_idx = {name: i for i, name in enumerate(benchmark.macro_names)}
+
     highlight_ids = set()
-    if args.highlight:
-        name_to_idx = {name: i for i, name in enumerate(benchmark.macro_names)}
-        for macro_name in args.highlight:
+    named_sources = args.highlight or cfg_names   # CLI takes priority over config
+    if named_sources:
+        for macro_name in named_sources:
             if macro_name in name_to_idx:
                 highlight_ids.add(name_to_idx[macro_name])
             else:
-                print(f"  [warn] --highlight: macro '{macro_name}' not found, skipping")
+                print(f"  [warn] highlight: macro '{macro_name}' not found, skipping")
         if highlight_ids:
             found = [benchmark.macro_names[i] for i in sorted(highlight_ids)]
-            print(f"  Highlight : {found}  (ids: {sorted(highlight_ids)})")
+            src = "CLI" if args.highlight else "config"
+            print(f"  Highlight : {found}  (ids: {sorted(highlight_ids)})  [{src}]")
+
+    if not highlight_ids:
+        n_random = args.highlight_random if args.highlight_random is not None \
+                   else cfg_n_random
+        if n_random > 0:
+            highlight_ids = _sample_highlight_ids(benchmark, n_random)
+            found = [benchmark.macro_names[i] for i in sorted(highlight_ids)]
+            print(f"  Highlight : {found}  (ids: {sorted(highlight_ids)})  [random, n={n_random}]")
+
+    # Annotate macros.dat with '*' next to highlighted macros (if it exists).
+    if highlight_ids:
+        highlight_names = {benchmark.macro_names[i] for i in highlight_ids}
+        macros_dat = frames_root / "macros.dat"
+        if macros_dat.exists():
+            _annotate_macros_dat(macros_dat, highlight_names)
+            print(f"  macros.dat: annotated with '*' for highlighted macros")
+
+    # --mip-only: render just the mIP (quadratic-init) PNG and exit
+    if args.mip_only:
+        mip_frame_path = frames_root / "frame_mip.pt"
+        if not mip_frame_path.exists():
+            print(f"[error] No frame_mip.pt found in {frames_root}", file=sys.stderr)
+            print("  Run the placer with initial_placement = \"quadratic\" and "
+                  "record_frames = true.", file=sys.stderr)
+            sys.exit(1)
+        mip_png_path = (Path(args.output) if args.output
+                        else Path(f"vis/{args.benchmark}_mip.png"))
+        mip_png_path.parent.mkdir(parents=True, exist_ok=True)
+        frame_data = torch.load(mip_frame_path, weights_only=False)
+        render_frame(frame_data, benchmark, net_edges, args.net_alpha,
+                     str(mip_png_path), dpi=150,
+                     highlight_ids=highlight_ids or None,
+                     label_override="mIP (quadratic init)")
+        print(f"  Saved mIP image: {mip_png_path}")
+        return
 
     # --legal-only: render just the legalized PNG and exit
     if args.legal_only:

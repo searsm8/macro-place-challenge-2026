@@ -31,12 +31,18 @@ Usage
 # The full Cartesian product is evaluated.
 SWEEP = {
     #"target_density": [0.50, 0.80],
-    #"lambda_pcof_upper": [1.03, 1.04, 1.05, 1.06],
-    #"density_weight": [8e-3, 1.6e-2],
     #"initial_spread": [0.01, 0.04, 0.15],
     #"lambda_hm_init": [1, 2, 3, 20],
     # "warmup_iters": [10, 20, 40],
     #"optimizer": ["sgd", "bb_sgd", "nesterov"],
+    "stop_overflow": [0.07],
+
+    "lambda_pcof_upper": [1.02, 1.03, 1.05, 1.06],
+    #"soft_place": ["False", "True"],
+    #"initial_placement": ["center", "quadratic"],
+    "density_weight": [8e-3, 1.6e-2],
+    #"hard_spread": ["False", "True"],
+    #"hard_spread_iters": [0, 50],
 }
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -62,7 +68,7 @@ UV          = "/home/msears/.local/bin/uv"
 
 IBM_BENCHMARKS = [
     "ibm01", "ibm02", "ibm03", "ibm04", "ibm06", "ibm07", "ibm08", "ibm09",
-    "ibm10", "ibm11", "ibm12", "ibm13", "ibm14", "ibm15", "ibm16", "ibm17", "ibm18",
+    #"ibm10", "ibm11", "ibm12", "ibm13", "ibm14", "ibm15", "ibm16", "ibm17", "ibm18",
 ]
 
 METRIC_COLS = ["proxy", "wl", "den", "cong", "valid", "time_s", "iters", "overlaps"]
