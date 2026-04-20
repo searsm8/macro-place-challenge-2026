@@ -309,8 +309,16 @@ class CometPlacer:
       - Density grad : pushes macros from overcrowded bins (repulsive)
     """
 
-    def __init__(self):
-        cfg = _loadConfig()
+    def __init__(self, config: dict | None = None):
+        """
+        Parameters
+        ----------
+        config : dict, optional
+            Full config dict (same structure as config.toml parsed by tomllib).
+            If None, the config file is auto-discovered as usual.  The GA uses
+            this to inject curtailed configs without touching the filesystem.
+        """
+        cfg = config if config is not None else _loadConfig()
         params = cfg.get("params", {})
         output_cfg = cfg.get("output", {})
 
@@ -320,6 +328,10 @@ class CometPlacer:
         self._readConvergenceParams(params)
         self._readPlacementParams(params)
         self._out = _output.OutputManager(output_cfg)
+        self._ga_config: dict = cfg.get("ga", {})
+
+        # Populated after each placement; consumed by the GA fitness oracle.
+        self.last_metrics: dict = {}
 
     def _readAlgorithmParams(self, p):
         self.max_iters = p.get("max_iters", 2000)
@@ -336,9 +348,12 @@ class CometPlacer:
         self.soft_place = _asBool(p.get("soft_place", False))
         self.hard_spread = _asBool(p.get("hard_spread", False))
         self.hard_spread_iters = p.get("hard_spread_iters", 50)
+        self.halo_size = float(p.get("halo_size", 0.0))
+        self.halo_legalize = float(p.get("halo_legalize", self.halo_size))
         self.use_precond = _asBool(p.get("use_preconditioner", True))
         self.optimizer = p.get("optimizer", "sgd")
         self.alpha_init = None if p.get("alpha_init", "auto") == "auto" else float(p["alpha_init"])
+        self.soft_place_iters = p.get("soft_place_iters", 1000)
 
     def _readLambdaParams(self, p):
         self.lambda_schedule = p.get("lambda_schedule", "hpwl")
@@ -367,6 +382,90 @@ class CometPlacer:
         self.quad_b2b_iters = p.get("quad_b2b_iters", 3)
         self.quad_net_size_threshold = p.get("quad_net_size_threshold", 50)
 
+    def placeWithData(self, benchmark, net_data: dict):
+        """
+        Run placement with a pre-built *net_data* dict.
+
+        Used by the GA to skip plc reloading and net_data construction for
+        each fitness evaluation.  Output logging and frame recording are
+        suppressed according to the placer's own output config (set
+        ``quiet=True`` and ``record_frames=False`` in the injected config for
+        silent GA evaluation runs).
+
+        Sets ``self.last_metrics = {"wl": float, "overflow": float}`` after
+        the run so the GA can read the fitness signal.
+
+        Returns
+        -------
+        full_pos : FloatTensor [num_total_macros, 2]
+        """
+        torch.manual_seed(self.seed)
+        np.random.seed(self.seed)
+
+        pos = self._gradientPlace(benchmark, net_data)
+
+        full_pos = benchmark.macro_positions.clone()
+        full_pos[:benchmark.num_macros] = pos
+        return full_pos
+
+    # -------------------------------------------------------------------
+    # GA helpers
+    # -------------------------------------------------------------------
+
+    def _runGa(self, benchmark, net_data_base: dict) -> tuple[dict, object]:
+        """
+        Run the GA outer loop and return (net_data_mod, bench_mod) for the
+        best chromosome found.
+
+        The GA evaluates curtailed placements (no legalization, fewer iters,
+        quiet output) via a lambda that instantiates a fresh CometPlacer with
+        a stripped-down config.
+        """
+        import genetic as _genetic
+
+        curtailed_cfg = self._buildCurtailedConfig()
+
+        def _eval(bench_mod, nd_mod):
+            p = CometPlacer(curtailed_cfg)
+            p.placeWithData(bench_mod, nd_mod)
+            return p.last_metrics
+
+        ga = _genetic.GeneticPlacer(self._ga_config)
+        self._out.log(
+            f"  GA: {ga.cfg}  "
+            f"(curtailed_iters={ga.cfg.curtailed_iters})"
+        )
+        best_chrom = ga.run(benchmark, net_data_base, _eval)
+        return best_chrom.applyToPlacement(net_data_base, benchmark)
+
+    def _buildCurtailedConfig(self) -> dict:
+        """
+        Build a config dict for GA evaluation runs:
+        - Inherits all [params] from the current placer (same density method,
+          optimizer, lambda schedule, etc.)
+        - Overrides max_iters with ga.curtailed_iters
+        - Disables phases 2.5 / 4 and legalization
+        - Silences all output and frame recording
+        """
+        base_cfg = _loadConfig()
+        params   = dict(base_cfg.get("params", {}))
+
+        params["max_iters"]    = self._ga_config.get("curtailed_iters", 300)
+        params["hard_spread"]  = False
+        params["soft_place"]   = False
+        params["legalization"] = "none"
+
+        return {
+            "params": params,
+            "output": {
+                "quiet":             True,
+                "record_frames":     False,
+                "record_iterations": False,
+                "log_every":         999999,
+            },
+            "ga": {},  # no nested GA in curtailed runs
+        }
+
     # -------------------------------------------------------------------
     # Top-level entry point
     # -------------------------------------------------------------------
@@ -392,6 +491,10 @@ class CometPlacer:
             return benchmark.macro_positions.clone()
         self._out.log(f"  {net_data['num_nets']} nets, {net_data['num_pins']} pins  "
                       f"({net_data['num_skipped']} nets skipped)")
+
+        # ── GA outer loop (optional) ──────────────────────────────────────
+        if _asBool(self._ga_config.get("enabled", False)):
+            net_data, benchmark = self._runGa(benchmark, net_data)
 
         pos = self._gradientPlace(benchmark, net_data)
 
@@ -436,7 +539,13 @@ class CometPlacer:
 
         self._out.close()
 
-        if self.legalization == "spiral":
+        if self.legalization == "bump":
+            self._out.log("  Legalizing (pairwise bump)...")
+            state["pos"] = _legalizer.bumpLegalize(
+                state["pos"], benchmark, halo_size=self.halo_legalize)
+            self._out.saveLegalFrame(t, state["pos"], state["prev_wl"],
+                                     state["gamma"], benchmark, state["num_macros"])
+        elif self.legalization == "spiral":
             self._out.log("  Legalizing (spiral push-out)...")
             state["pos"] = _legalizer.spiralLegalize(state["pos"], benchmark)
             self._out.saveLegalFrame(t, state["pos"], state["prev_wl"],
@@ -447,7 +556,16 @@ class CometPlacer:
                                            frame_offset=t + 1)
             # Overwrite frame_legal.pt so the GIF ends on the phase 4 result
             self._out.saveLegalFrame(t, state["pos"], state["prev_wl"],
-                                     state["gamma"], benchmark, state["num_macros"])
+                                     state["gamma"], benchmark, state["num_macros"],
+                                     phase="4: cGP")
+
+        # Expose final metrics for external callers (e.g. GA fitness oracle).
+        self.last_metrics = {
+            "wl": float(state["prev_wl"]),
+            "overflow": float(
+                state["overflow_history"][-1] if state["overflow_history"] else 1.0
+            ),
+        }
 
         return state["pos"]
 
@@ -511,7 +629,7 @@ class CometPlacer:
 
             self._out.saveFrame(t, state["pos"], wl_val, den_energy, overflow,
                                 state["lambda_d"], 0.0, state["gamma"],
-                                benchmark, state["num_macros"])
+                                benchmark, state["num_macros"], phase="2.5: mGP")
 
             state["prev_wl"] = wl_val
             state["prev_overflow"] = overflow
@@ -570,9 +688,7 @@ class CometPlacer:
             "loss_history": [],
             "overflow_history": [],
             "ref_hpwl": 1.0,
-            # Only soft macros contribute to the density map; hard macros are
-            # fixed obstacles that only appear in the HPWL term.
-            "density_mask": benchmark.get_soft_macro_mask(),
+            "overflow_ema": float("inf"),
         }
 
         # Scatter soft macros uniformly across the canvas as a fresh start.
@@ -611,7 +727,8 @@ class CometPlacer:
                 self._stepSgd(grad, state)
 
             self._trackBestWl(wl_val, state)
-            self._updateLambda(t, wl_val, wl_grad, den_grad, den_energy, state)
+            self._updateLambda(t, wl_val, wl_grad, den_grad, den_energy, state,
+                               overflow=overflow)
             state["gamma"] = max(state["gamma"] * self.gamma_decay, gamma_min)
 
             if self._out.shouldLog(t, self.soft_place_iters):
@@ -626,7 +743,7 @@ class CometPlacer:
 
             self._out.saveFrame(t + frame_offset, state["pos"], wl_val, den_energy,
                                 overflow, state["lambda_d"], 0.0, state["gamma"],
-                                benchmark, state["num_macros"])
+                                benchmark, state["num_macros"], phase="4: cGP")
 
             if converged:
                 break
@@ -684,7 +801,9 @@ class CometPlacer:
             "loss_history": [],
             "overflow_history": [],
             "ref_hpwl": 1.0,
+            "overflow_ema": float("inf"),
             "density_mask": None,  # None = all macros contribute; set for phase 4
+            "halo_size": self.halo_size,
         }
 
         self._initOptimizer(state, max_step, pos)
@@ -778,7 +897,8 @@ class CometPlacer:
                 return True
 
         self._trackBestWl(wl_val, state)
-        self._updateLambda(t, wl_val, wl_grad, den_grad, den_energy, state)
+        self._updateLambda(t, wl_val, wl_grad, den_grad, den_energy, state,
+                           overflow=overflow)
         state["gamma"] = max(state["gamma"] * self.gamma_decay, state["gamma_min"])
         # Decay hard-macro density boost toward 1.0
         if state["lambda_hm"] > 1.0:
@@ -821,7 +941,8 @@ class CometPlacer:
         if need_density:
             return _density.computeDensityGradient(
                 self.density_method, eval_pos, benchmark, self.target_density,
-                density_mask=state.get("density_mask"))
+                density_mask=state.get("density_mask"),
+                halo_size=state.get("halo_size", 0.0))
         return (torch.zeros_like(state["pos"]), 0.0, float("inf"), float("inf"))
 
     def _combineGradients(self, wl_grad, den_grad, state):
@@ -948,7 +1069,8 @@ class CometPlacer:
             state["best_wl"] = wl_val
             state["best_pos"] = state["pos"].clone()
 
-    def _updateLambda(self, t, wl_val, wl_grad, den_grad, den_energy, state):
+    def _updateLambda(self, t, wl_val, wl_grad, den_grad, den_energy, state,
+                      overflow=None):
         """Update density weight lambda according to the schedule."""
         total_loss = wl_val + state["lambda_d"] * den_energy
         state["loss_history"].append(total_loss)
@@ -957,32 +1079,52 @@ class CometPlacer:
             return
 
         if state["lambda_d"] == 0.0:
-            self._initLambda(wl_val, wl_grad, den_grad, state)
-        elif t % 3 == 0:  # update lambda every 3 iters to reduce noise
-            self._rampLambda(t, wl_val, state)
+            self._initLambda(wl_val, wl_grad, den_grad, state, overflow)
+        else:
+            self._rampLambda(t, wl_val, overflow, state)
 
-    def _initLambda(self, wl_val, wl_grad, den_grad, state):
+    def _initLambda(self, wl_val, wl_grad, den_grad, state, overflow=None):
         """Auto-initialise lambda at warmup transition."""
         if self.lambda_schedule == "hpwl":
             wl_norm = wl_grad.norm(p=1).item()
             den_norm = den_grad.norm(p=1).item()
             state["lambda_d"] = self.density_weight * wl_norm / (den_norm + 1e-8)
             state["ref_hpwl"] = wl_val
+            state["overflow_ema"] = overflow if overflow is not None else float("inf")
         else:
             state["lambda_d"] = self.density_weight_init
+            state["overflow_ema"] = float("inf")
 
-    def _rampLambda(self, t, wl_val, state):
-        """Ramp lambda using HPWL-feedback or geometric schedule."""
+    def _rampLambda(self, t, wl_val, overflow, state):
+        """Ramp lambda using overflow-feedback or geometric schedule.
+
+        Overflow-feedback (hpwl mode):
+          Uses an EMA of recent overflow (τ≈10 iters) as the reference.
+          - Current overflow is >1% below EMA → spreading is actively working
+            → hold lambda (mu=1.0). This prevents chaotic explosion once macros
+            start separating.
+          - Otherwise → ramp by lambda_pcof_upper.
+            Macros are stuck; push the density force harder.
+
+          Runs every iteration (no t%3 gate). When macros are stuck the ramp
+          is 3× faster than the old every-3-iter approach, reaching the
+          spreading threshold sooner.
+        """
         if self.lambda_schedule == "hpwl":
-            delta_hpwl = wl_val - state["prev_wl"]
-            if delta_hpwl < 0:
-                mu = self.lambda_pcof_upper * max(0.9999 ** t, 0.98)
+            ema = state.get("overflow_ema", float("inf"))
+            if overflow is not None and ema < float("inf"):
+                state["overflow_ema"] = 0.9 * ema + 0.1 * overflow
+                if overflow < state["overflow_ema"] * 0.99:
+                    # Overflow is meaningfully below recent average — spreading is
+                    # working; ramp gently (pcof_lower) so lambda still grows but
+                    # doesn't overshoot.
+                    mu = self.lambda_pcof_lower
+                else:
+                    mu = self.lambda_pcof_upper
             else:
-                mu = self.lambda_pcof_upper * (
-                    self.lambda_pcof_upper
-                    ** (-delta_hpwl / (state["ref_hpwl"] + 1e-8)))
-                mu = max(self.lambda_pcof_lower,
-                         min(self.lambda_pcof_upper, mu))
+                if overflow is not None:
+                    state["overflow_ema"] = overflow
+                mu = self.lambda_pcof_upper
         else:
             mu = self.density_weight_max_step
 
@@ -1004,6 +1146,8 @@ class CometPlacer:
         if self._checkMaxDensity(max_den, t):
             return True
         if self._checkPlateau(overflow, state, t):
+            return True
+        if self._checkLambdaMax(overflow, state, t):
             return True
         if self._checkDivergence(wl_val, state, t):
             return True
@@ -1029,7 +1173,7 @@ class CometPlacer:
         """Lsub plateau: moving-average loss flat."""
         w = self.plateau_window
         history = state["loss_history"]
-        if (overflow < self.stop_overflow * 3 and len(history) >= 2 * w):
+        if (overflow < self.stop_overflow * 2 and len(history) >= 2 * w):
             cur_avg = sum(history[-w:]) / w
             prev_avg = sum(history[-2 * w:-w]) / w
             rel_change = abs(cur_avg - prev_avg) / (prev_avg + 1e-12)
@@ -1037,6 +1181,23 @@ class CometPlacer:
                 self._out.log(f"  [plateau] iter {t}: loss avg flat "
                               f"{cur_avg:.4f} \u2248 {prev_avg:.4f} "
                               f"(rel={rel_change:.4f})")
+                return True
+        return False
+
+    def _checkLambdaMax(self, overflow, state, t):
+        """Lambda-max: lambda is pegged at ceiling AND overflow has stopped improving."""
+        if state["lambda_d"] < self.density_weight_max * 0.99:
+            return False
+        w = self.plateau_window
+        oh = state["overflow_history"]
+        if len(oh) >= 2 * w:
+            cur_avg = sum(oh[-w:]) / w
+            prev_avg = sum(oh[-2 * w:-w]) / w
+            rel_change = abs(cur_avg - prev_avg) / (prev_avg + 1e-12)
+            if rel_change < self.plateau_thresh:
+                self._out.log(
+                    f"  [lambda-max] iter {t}: lambda at max {state['lambda_d']:.2e}, "
+                    f"overflow flat at {overflow:.4f}")
                 return True
         return False
 

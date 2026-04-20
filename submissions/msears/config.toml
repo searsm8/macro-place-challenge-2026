@@ -30,7 +30,7 @@ divergence_window  = 50     # stop if overflow rising AND wl > 5× best wl (last
 
 # ── Method selection ──────────────────────────────────────────────────────
 density_method        = "electrostatic"   # "bell" or "electrostatic"
-legalization          = "spiral"          # "none" or "spiral"
+legalization          = "bump"            # "none", "bump", or "spiral"
 use_preconditioner    = true              # divide gradient by (macro_area + net_degree)
 optimizer             = "bb_sgd"          # "sgd", "bb_sgd", or "nesterov"
 alpha_init            = "auto"            # initial step size for bb_sgd/nesterov
@@ -40,12 +40,12 @@ lambda_schedule         = "hpwl"  # "hpwl" (feedback) or "geometric" (fixed ramp
 
 # hpwl mode
 density_weight          = 8e-3
-lambda_pcof_upper       = 1.05
-lambda_pcof_lower       = 0.95
+lambda_pcof_upper       = 1.05   # multiplier when overflow is NOT improving (ramp hard)
+lambda_pcof_lower       = 1.01   # multiplier when overflow IS actively decreasing (gentle ramp)
 
 # geometric mode
 density_weight_init     = 1e-5
-density_weight_max_step = 1.04
+density_weight_max_step = 1.05
 
 # shared
 warmup_iters            = 20
@@ -58,6 +58,14 @@ target_density          = 0.5
 lambda_hm_init          = 1.0    # initial hard-macro density boost
 lambda_hm_decay         = 0.995  # per-iter decay (reaches ~1.0 after ~220 iters)
 
+# ── Macro halos ───────────────────────────────────────────────────────────
+# Inflate hard macro footprints in the density map by this fraction.
+# halo_size = 0.1 -> each hard macro occupies (1.1w) × (1.1h) in the density
+# field, reserving whitespace so the legalizer makes smaller corrections.
+# Charge is conserved via area_ratio scaling (see density.py). 0 = disabled.
+halo_size         = 0.4
+halo_legalize     = 0.1
+
 # ── Phase 2.5: Hard-macro spread before legalization ──────────────────────
 # After convergence, remove soft macros from the density map and run a short
 # continuation. Hard macros spread freely; all macros still feel the field.
@@ -68,7 +76,7 @@ hard_spread_iters = 50     # number of SGD iterations for phase 2.5
 # ── Phase 4: Std-cell global placement (cGP) ──────────────────────────────
 # After hard-macro legalization, lock hard macros and re-run WL + density
 # gradient descent for soft macros only, filling whitespace left by mLG.
-soft_place              = true # enable phase 4
+soft_place              = false # enable phase 4
 soft_place_iters        = 1000   # max iterations for cGP phase (early stopping applies)
 
 [output]
@@ -82,3 +90,19 @@ quiet         = false
 highlight_macros = []
 # Randomly highlight N macros weighted by area. Used only when highlight_macros is empty.
 highlight_random_macros = 3
+
+# ── Genetic Algorithm (orientation search) ────────────────────────────────────
+# Set enabled = true to activate. The GA runs before the full gradient descent,
+# finding the best hard-macro orientation assignment via curtailed placements.
+[ga]
+enabled              = false    # flip to true to activate
+population_size      = 16
+n_generations        = 50
+elite_frac           = 0.25     # top fraction preserved unchanged each generation
+mutation_rate        = 0.05     # per-gene probability of random orientation flip
+tournament_k         = 3        # tournament selection pool size
+curtailed_iters      = 300      # max_iters for fast GA evaluation runs (no legalization)
+fitness_wl_weight    = 1.0      # WL contribution to fitness
+fitness_overflow_weight = 0.5   # overflow ratio contribution to fitness
+n_workers            = 1        # >1 enables multiprocessing (not yet implemented)
+seed                 = 0        # RNG seed for reproducible GA runs
