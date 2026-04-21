@@ -246,6 +246,7 @@ def _print_summary_table(results):
 
 
 def main():
+    sys.stdout.reconfigure(line_buffering=True)
     parser = argparse.ArgumentParser(
         prog="evaluate",
         description="Evaluate a macro-placement submission on IBM ICCAD04 benchmarks.",

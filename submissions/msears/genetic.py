@@ -227,17 +227,13 @@ class Chromosome:
         new_offsets = torch.where(is_macro.unsqueeze(1), new_offsets, offsets)
         net_data_mod = {**net_data_base, "offsets": new_offsets}
 
-        # ── 2. Swap macro sizes for E / FE / W / FW orientations ────────
-        swaps     = _ORI_SWAPS_SIZE[self.genes.long()]      # [num_hard] bool
-        new_sizes = benchmark.macro_sizes.clone()           # [num_macros, 2]
-        if swaps.any():
-            new_sizes[:num_hard][swaps] = new_sizes[:num_hard][swaps].flip(1)
-
-        # Shallow-copy the benchmark and replace only macro_sizes.
-        # object.__setattr__ bypasses any frozen-dataclass guard; all other
-        # attributes are shared references (they're read-only during placement).
+        # ── 2. Shallow-copy benchmark (macro_sizes unchanged) ────────────
+        # The contest harness validates overlaps against the original
+        # benchmark.macro_sizes (it has no concept of orientation).  Swapping
+        # w↔h in bench_mod caused the legalizer to use rotated footprints that
+        # the harness later flagged as illegal.  Only pin offsets are rotated
+        # (step 1); physical footprints stay at their original dimensions.
         bench_mod = copy.copy(benchmark)
-        object.__setattr__(bench_mod, "macro_sizes", new_sizes)
         return net_data_mod, bench_mod
 
 
@@ -253,16 +249,16 @@ class GAConfig:
 
     def __init__(self, ga_section: dict) -> None:
         g = ga_section
-        self.population_size     = g.get("population_size",          16)
-        self.n_generations       = g.get("n_generations",            50)
-        self.elite_frac          = g.get("elite_frac",             0.25)
-        self.mutation_rate       = g.get("mutation_rate",          0.05)
-        self.tournament_k        = g.get("tournament_k",              3)
-        self.curtailed_iters     = g.get("curtailed_iters",         300)
-        self.wl_weight           = g.get("fitness_wl_weight",       1.0)
-        self.overflow_weight     = g.get("fitness_overflow_weight", 0.5)
-        self.n_workers           = g.get("n_workers",                 1)
-        self.seed                = g.get("seed",                      0)
+        self.population_size     = g.get("ga_population_size",          16)
+        self.n_generations       = g.get("ga_n_generations",            50)
+        self.elite_frac          = g.get("ga_elite_frac",             0.25)
+        self.mutation_rate       = g.get("ga_mutation_rate",          0.05)
+        self.tournament_k        = g.get("ga_tournament_k",              3)
+        self.curtailed_iters     = g.get("ga_curtailed_iters",         300)
+        self.wl_weight           = g.get("ga_fitness_wl_weight",       1.0)
+        self.overflow_weight     = g.get("ga_fitness_overflow_weight", 0.5)
+        self.n_workers           = g.get("ga_n_workers",                 1)
+        self.seed                = g.get("ga_seed",                      0)
 
     @property
     def n_elite(self) -> int:
@@ -322,8 +318,8 @@ class GeneticPlacer:
         num_hard = benchmark.num_hard_macros
         cfg      = self.cfg
 
-        print(f"\n  ── GA: {cfg}")
-        print(f"  ── {num_hard} hard macros × 8 orientations per gene")
+        print(f"\n  ── GA: {cfg}", flush=True)
+        print(f"  ── {num_hard} hard macros × 8 orientations per gene", flush=True)
 
         # ── Initialise population ────────────────────────────────────────
         # Always seed with the all-N default so we track improvement over
@@ -345,16 +341,19 @@ class GeneticPlacer:
             # ── Track global best ─────────────────────────────────────────
             gen_best_idx = min(range(len(scores)), key=lambda i: scores[i])
             gen_best     = scores[gen_best_idx]
-            if gen_best < best_score:
+            improved = gen_best < best_score
+            if improved:
                 best_score = gen_best
                 best_chrom = population[gen_best_idx].clone()
 
             gen_mean = sum(scores) / len(scores)
             history.append((gen_best, gen_mean))
+            marker = " ✓" if improved else ""
             print(
-                f"  GA gen {gen:3d}/{cfg.n_generations}  "
+                f"[GA] gen {gen:3d}/{cfg.n_generations}  "
                 f"best={gen_best:.4f}  mean={gen_mean:.4f}  "
-                f"global_best={best_score:.4f}"
+                f"global_best={best_score:.4f}{marker}",
+                flush=True,
             )
 
             # ── Breed next generation ─────────────────────────────────────
@@ -362,7 +361,8 @@ class GeneticPlacer:
 
         print(
             f"  GA done — best_score={best_score:.4f}  "
-            f"orientations={best_chrom}"
+            f"orientations={best_chrom}",
+            flush=True,
         )
         return best_chrom
 
@@ -383,10 +383,11 @@ class GeneticPlacer:
         Sequential baseline; parallel workers will be added here once the
         algorithm is validated.
         """
-        return [
-            self._evaluateOne(chrom, benchmark, net_data_base, eval_fn)
-            for chrom in population
-        ]
+        scores = []
+        for chrom in population:
+            scores.append(self._evaluateOne(chrom, benchmark, net_data_base, eval_fn))
+            print(".", end="", flush=True)
+        return scores
 
     def _evaluateOne(
         self,

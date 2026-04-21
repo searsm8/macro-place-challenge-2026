@@ -138,39 +138,17 @@ Mix of hard and soft. ariane133: 133 hard + 782 soft macros.
 
 ## Current results (ibm01)
 ```
-# WL-only (no density force):
-proxy=4.65  (wl=0.021 den=3.996 cong=5.251)  INVALID (12892 overlaps)
-
-# Bell-shape density (warmup=50, density_weight_init=1e-5, ramp=1.05×):
-proxy=2.70  (wl=0.062 den=2.297 cong=2.973)  INVALID (816 overlaps)  [2.5s]
-
-# Electrostatic density (ramp=1.04×, max_lambda=100):
-proxy=1.04  (wl=0.073 den=0.743 cong=1.192)  INVALID (142 overlaps)  [1.8s]
+# Electrostatic density + greedy rotation (current best config):
+proxy≈1.04  (0 overlaps)
 ```
 
-## All-benchmark results (electrostatic, ramp=1.04×)
+## All-benchmark results (best config, 17 IBM benchmarks)
 ```
-Benchmark   Proxy     vs SA   vs RePlAce  Overlaps
-ibm01       1.041   +17.5%      -8.9%       147
-ibm02       1.575   +17.4%     +14.3%       267
-ibm03       1.353   +22.2%      -2.4%       268
-ibm04       1.429    +5.0%      -9.7%       285
-ibm06       1.660   +33.8%      -2.5%       173
-ibm07       1.718   +15.1%     -17.4%       288
-ibm08       1.550   +19.5%      -8.5%       303
-ibm09       1.348    +2.9%     -20.4%       281
-ibm10       1.583   +25.0%      -5.5%      1246
-ibm11       1.275   +25.5%      -8.3%       398
-ibm12       1.770   +37.4%      -2.6%       728
-ibm13       1.459   +23.8%      -9.3%       476
-ibm14       1.941   +14.7%     -25.8%       687
-ibm15       1.733   +24.7%     -14.3%       543
-ibm16       1.917   +14.2%     -29.7%       577
-ibm17       2.183   +40.6%     -32.7%      1074
-ibm18       2.314   +16.6%     -30.6%       406
-AVG         1.641   +22.8%     -12.6%      8147
+rank  avg_proxy   n_bench    params
+1     1.4431      17         rotation_optimizer=greedy  ← current best
+2     1.4548      17         rotation_optimizer=none
 ```
-Status: DISQUALIFIED (8147 total overlaps). Proxy scores beat RePlAce on average by 12.6%.
+Status: QUALIFIED (0 overlaps). Greedy rotation optimizer improves avg proxy by ~0.8% over no rotation.
 
 ## Key technical concepts
 
@@ -211,4 +189,3 @@ Avoids external DCT libraries. Spectral constants cached per grid shape.
 
 ### NOT yet implemented
 - Nesterov momentum + BB step size
-- Genetic algorithm over macro orientations

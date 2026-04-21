@@ -17,19 +17,19 @@ def printBenchmarkInfo(benchmark, density_method):
     sizes = benchmark.macro_sizes[:num_macros]
     utilisation = (sizes[:, 0] * sizes[:, 1]).sum() / (canvas_w * canvas_h) * 100
 
-    print(f"\n  Benchmark : {benchmark.name}")
+    print(f"\n  Benchmark : {benchmark.name}", flush=True)
     print(f"  Macros    : {benchmark.num_hard_macros} hard + "
           f"{benchmark.num_soft_macros} soft = {num_macros} total  "
-          f"({int(benchmark.macro_fixed[:num_macros].sum())} fixed)")
+          f"({int(benchmark.macro_fixed[:num_macros].sum())} fixed)", flush=True)
     print(f"  Nets      : {benchmark.num_nets}   "
-          f"I/O ports: {benchmark.port_positions.shape[0]}")
+          f"I/O ports: {benchmark.port_positions.shape[0]}", flush=True)
     print(f"  Canvas    : {canvas_w:.2f} x {canvas_h:.2f} um   "
-          f"Grid: {benchmark.grid_rows}r x {benchmark.grid_cols}c")
+          f"Grid: {benchmark.grid_rows}r x {benchmark.grid_cols}c", flush=True)
     print(f"  Area util : {utilisation:.1f}%   "
           f"W:[{sizes[:,0].min():.3f}, {sizes[:,0].max():.3f}]  "
-          f"H:[{sizes[:,1].min():.3f}, {sizes[:,1].max():.3f}]")
-    print(f"  Density   : {density_method}")
-    print()
+          f"H:[{sizes[:,1].min():.3f}, {sizes[:,1].max():.3f}]", flush=True)
+    print(f"  Density   : {density_method}", flush=True)
+    print(flush=True)
 
 
 def writeMacroDat(pos, benchmark, net_data, plc, out_path):
@@ -120,6 +120,7 @@ class OutputManager:
     def log(self, msg, **kwargs):
         """Print unless quiet mode is active."""
         if not self.quiet:
+            kwargs.setdefault("flush", True)
             print(msg, **kwargs)
 
     def setupFrames(self, benchmark, net_data):
@@ -173,7 +174,7 @@ class OutputManager:
                 and (iter_num % self.log_every == 0 or iter_num == max_iters - 1))
 
     def saveFrame(self, iter_num, pos, wl_val, den_energy, overflow,
-                  lambda_d, alpha, gamma, benchmark, num_macros):
+                  lambda_d, alpha, gamma, benchmark, num_macros, phase="2: mGP"):
         """Save a frame snapshot to disk."""
         if not self.record_frames or self._bench_frames_dir is None:
             return
@@ -186,6 +187,7 @@ class OutputManager:
             "lambda_d": lambda_d,
             "alpha": alpha,
             "gamma": gamma,
+            "phase": phase,
             "benchmark_name": benchmark.name,
             "canvas_width": float(benchmark.canvas_width),
             "canvas_height": float(benchmark.canvas_height),
@@ -206,6 +208,7 @@ class OutputManager:
             "lambda_d": 0.0,
             "alpha": 0.0,
             "gamma": 0.0,
+            "phase": "1: mIP",
             "benchmark_name": benchmark.name,
             "canvas_width": float(benchmark.canvas_width),
             "canvas_height": float(benchmark.canvas_height),
@@ -213,7 +216,8 @@ class OutputManager:
             "num_hard": benchmark.num_hard_macros,
         }, self._bench_frames_dir / "frame_mip.pt")
 
-    def saveLegalFrame(self, iter_num, pos, wl_val, gamma, benchmark, num_macros):
+    def saveLegalFrame(self, iter_num, pos, wl_val, gamma, benchmark, num_macros,
+                       phase="3: mLG"):
         """Save the legalized placement as frame_legal.pt."""
         if not self.record_frames or self._bench_frames_dir is None:
             return
@@ -226,6 +230,7 @@ class OutputManager:
             "lambda_d": 0.0,
             "alpha": 0.0,
             "gamma": gamma,
+            "phase": phase,
             "benchmark_name": benchmark.name,
             "canvas_width": float(benchmark.canvas_width),
             "canvas_height": float(benchmark.canvas_height),

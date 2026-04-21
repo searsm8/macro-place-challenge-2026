@@ -325,18 +325,31 @@ def render_frame(frame_data, benchmark, net_edges, net_alpha, save_path, dpi,
         ovfw_str = "   ovfw=∞"
     else:
         ovfw_str = f"   ovfw={overflow:.3f}"
-    if label_override:
-        iter_str = label_override
-    else:
-        iter_str = f"iter {iteration:4d}"
+    iter_str = f"iter {iteration:4d}"
     ax.set_title(
         f"{name}{nets_label}  |  {iter_str}   "
         f"WL={wl_loss:.1f}{ovfw_str}   γ={gamma:.4f}{alpha_label}{lambda_label}",
         fontsize=9,
     )
-    ax.set_xlabel("x (um)")
-    ax.set_ylabel("y (um)")
-    ax.tick_params(labelsize=7)
+    ax.set_xlabel("")
+    ax.set_ylabel("")
+    ax.tick_params(labelsize=7, labelbottom=False, labelleft=False)
+
+    # ── Phase label at the bottom ──────────────────────────────────────────
+    phase = frame_data.get("phase", "")
+    if phase:
+        phase_text = f"Phase {phase}"
+    elif label_override:
+        phase_text = label_override
+    else:
+        phase_text = ""
+    if phase_text:
+        ax.text(
+            0.5, -0.02, phase_text,
+            transform=ax.transAxes,
+            ha="center", va="top",
+            fontsize=10, fontweight="bold",
+        )
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
@@ -440,8 +453,7 @@ def main():
         frame_data = torch.load(legal_frame_path, weights_only=False)
         render_frame(frame_data, benchmark, net_edges, args.net_alpha,
                      str(legal_png_path), dpi=150,
-                     highlight_ids=highlight_ids or None,
-                     label_override="LEGALIZED")
+                     highlight_ids=highlight_ids or None)
         print(f"  Saved legalized image: {legal_png_path}")
         return
 
@@ -494,8 +506,7 @@ def main():
             png_path = Path(tmpdir) / "frame_legal.png"
             render_frame(frame_data, benchmark, net_edges, args.net_alpha,
                          str(png_path), args.dpi,
-                         highlight_ids=highlight_ids or None,
-                         label_override="LEGALIZED")
+                         highlight_ids=highlight_ids or None)
             pil_frames.append(Image.open(png_path).copy())
             frame_durations.append(5000)  # 5-second pause on the final frame
 
@@ -505,8 +516,7 @@ def main():
             )
             render_frame(frame_data, benchmark, net_edges, args.net_alpha,
                          str(legal_png_path), dpi=150,
-                         highlight_ids=highlight_ids or None,
-                         label_override="LEGALIZED")
+                         highlight_ids=highlight_ids or None)
             print(f"\n  Saved legalized image: {legal_png_path}")
 
     print()  # newline after progress bar

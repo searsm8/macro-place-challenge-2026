@@ -23,7 +23,7 @@ gamma_min_frac = 0.00667 # gamma_min = canvas_diag * gamma_min_frac
 max_step      = "auto"
 
 # ── Convergence ───────────────────────────────────────────────────────────
-stop_overflow      = 0.1    # Lgamma: stop when overflow_ratio < this AND wl rising
+stop_overflow      = 0.05    # Lgamma: stop when overflow_ratio < this AND wl rising
 plateau_window     = 10     # Lsub: moving-average window for loss plateau detection
 plateau_threshold  = 0.001  # Lsub: stop when improvement < this fraction per window
 divergence_window  = 50     # stop if overflow rising AND wl > 5× best wl (last N iters)
@@ -31,6 +31,12 @@ divergence_window  = 50     # stop if overflow rising AND wl > 5× best wl (last
 # ── Method selection ──────────────────────────────────────────────────────
 density_method        = "electrostatic"   # "bell" or "electrostatic"
 legalization          = "bump"            # "none", "bump", or "spiral"
+rotation_optimizer    = "none"            # "none", "greedy", "anneal", "periodic", "genetic"
+rotation_passes       = 2                 # greedy: full passes; periodic: passes per trigger
+rotation_period       = 20               # periodic: gradient iters between rotation calls
+sa_T_init             = 1e-4             # SA initial temperature (WL units)
+sa_T_final            = 1e-7             # SA final temperature
+sa_steps_per_macro    = 200              # SA total steps = this × num_hard_macros
 use_preconditioner    = true              # divide gradient by (macro_area + net_degree)
 optimizer             = "bb_sgd"          # "sgd", "bb_sgd", or "nesterov"
 alpha_init            = "auto"            # initial step size for bb_sgd/nesterov
@@ -76,7 +82,7 @@ hard_spread_iters = 50     # number of SGD iterations for phase 2.5
 # ── Phase 4: Std-cell global placement (cGP) ──────────────────────────────
 # After hard-macro legalization, lock hard macros and re-run WL + density
 # gradient descent for soft macros only, filling whitespace left by mLG.
-soft_place              = false # enable phase 4
+soft_place              = true # enable phase 4
 soft_place_iters        = 1000   # max iterations for cGP phase (early stopping applies)
 
 [output]
@@ -95,14 +101,14 @@ highlight_random_macros = 3
 # Set enabled = true to activate. The GA runs before the full gradient descent,
 # finding the best hard-macro orientation assignment via curtailed placements.
 [ga]
-enabled              = false    # flip to true to activate
-population_size      = 16
-n_generations        = 50
-elite_frac           = 0.25     # top fraction preserved unchanged each generation
-mutation_rate        = 0.05     # per-gene probability of random orientation flip
-tournament_k         = 3        # tournament selection pool size
-curtailed_iters      = 300      # max_iters for fast GA evaluation runs (no legalization)
-fitness_wl_weight    = 1.0      # WL contribution to fitness
-fitness_overflow_weight = 0.5   # overflow ratio contribution to fitness
-n_workers            = 1        # >1 enables multiprocessing (not yet implemented)
-seed                 = 0        # RNG seed for reproducible GA runs
+ga_enable               = false
+ga_population_size      = 16
+ga_n_generations        = 50
+ga_elite_frac           = 0.25     # top fraction preserved unchanged each generation
+ga_mutation_rate        = 0.05     # per-gene probability of random orientation flip
+ga_tournament_k         = 3        # tournament selection pool size
+ga_curtailed_iters      = 300      # max_iters for fast GA evaluation runs (no legalization)
+ga_fitness_wl_weight    = 1.0      # WL contribution to fitness
+ga_fitness_overflow_weight = 0.5   # overflow ratio contribution to fitness
+ga_n_workers            = 1        # >1 enables multiprocessing (not yet implemented)
+ga_seed                 = 0        # RNG seed for reproducible GA runs

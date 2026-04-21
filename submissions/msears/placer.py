@@ -41,6 +41,8 @@ def _importSibling(name):
 _density = _importSibling("density")
 _legalizer = _importSibling("legalizer")
 _output = _importSibling("output")
+_genetic = _importSibling("genetic")
+_rotation = _importSibling("rotation")
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +356,12 @@ class CometPlacer:
         self.optimizer = p.get("optimizer", "sgd")
         self.alpha_init = None if p.get("alpha_init", "auto") == "auto" else float(p["alpha_init"])
         self.soft_place_iters = p.get("soft_place_iters", 1000)
+        self.rotation_optimizer  = p.get("rotation_optimizer", "none")   # none/greedy/anneal/periodic/genetic
+        self.rotation_passes     = p.get("rotation_passes", 1)            # greedy: full passes over all macros
+        self.rotation_period     = p.get("rotation_period", 20)           # periodic: iters between rotation calls
+        self.sa_T_init           = p.get("sa_T_init", 1e-4)
+        self.sa_T_final          = p.get("sa_T_final", 1e-7)
+        self.sa_steps_per_macro  = p.get("sa_steps_per_macro", 200)
 
     def _readLambdaParams(self, p):
         self.lambda_schedule = p.get("lambda_schedule", "hpwl")
@@ -409,20 +417,68 @@ class CometPlacer:
         return full_pos
 
     # -------------------------------------------------------------------
+    # Rotation optimizer
+    # -------------------------------------------------------------------
+
+    # Our internal orientation indices 4-7 (E, FE, W, FW) have opposite rotation
+    # direction to the plc's same-named orientations.  The correct plc name for
+    # each of our indices is:  N→N  FN→FN  S→S  FS→FS  E→W  FE→FW  W→E  FW→FE
+    _OUR_ORI_TO_PLC = ["N", "FN", "S", "FS", "W", "FW", "E", "FE"]
+
+    def _runRotationOptimizer(self, pos, net_data, net_data_base, genes, benchmark, gamma, plc=None):
+        """
+        Call the appropriate rotation function (greedy or SA), log results,
+        then sync the chosen orientations back into the plc object so the
+        harness evaluator sees the rotated pin positions.
+        """
+        prev_genes = genes.clone()
+        candidates = (0, 2)   # N and S only — correct plc mapping, no size swap
+
+        mode = self.rotation_optimizer
+        if mode == "greedy":
+            n = _rotation.greedy_rotate(
+                pos, net_data["offsets"], net_data_base,
+                genes, benchmark, gamma=gamma,
+                n_passes=self.rotation_passes,
+                candidates=candidates,
+            )
+            self._out.log(f"  Rotation (greedy, {self.rotation_passes} pass): {n} macro(s) flipped")
+        elif mode == "anneal":
+            n_steps = self.sa_steps_per_macro * benchmark.num_hard_macros
+            n = _rotation.sa_rotate(
+                pos, net_data["offsets"], net_data_base,
+                genes, benchmark, gamma=gamma,
+                n_steps=n_steps,
+                T_init=self.sa_T_init,
+                T_final=self.sa_T_final,
+                candidates=candidates,
+            )
+            self._out.log(
+                f"  Rotation (SA, {n_steps} steps, T {self.sa_T_init:.1e}→{self.sa_T_final:.1e}): "
+                f"{n} accepted"
+            )
+
+        # Sync changed orientations back to plc so harness sees rotated pin positions.
+        # Uses _OUR_ORI_TO_PLC to map our index → correct plc orientation name.
+        if plc is not None:
+            for m in range(benchmark.num_hard_macros):
+                if int(genes[m]) != int(prev_genes[m]):
+                    plc_idx  = plc.hard_macro_indices[m]
+                    plc_name = self._OUR_ORI_TO_PLC[int(genes[m])]
+                    plc.update_macro_orientation(plc_idx, plc_name)
+
+    # -------------------------------------------------------------------
     # GA helpers
     # -------------------------------------------------------------------
 
-    def _runGa(self, benchmark, net_data_base: dict) -> tuple[dict, object]:
+    def _runGa(self, benchmark, net_data_base: dict) -> tuple[dict, object, object]:
         """
-        Run the GA outer loop and return (net_data_mod, bench_mod) for the
-        best chromosome found.
+        Run the GA outer loop and return (net_data_mod, bench_mod, best_genes).
 
         The GA evaluates curtailed placements (no legalization, fewer iters,
         quiet output) via a lambda that instantiates a fresh CometPlacer with
         a stripped-down config.
         """
-        import genetic as _genetic
-
         curtailed_cfg = self._buildCurtailedConfig()
 
         def _eval(bench_mod, nd_mod):
@@ -436,7 +492,8 @@ class CometPlacer:
             f"(curtailed_iters={ga.cfg.curtailed_iters})"
         )
         best_chrom = ga.run(benchmark, net_data_base, _eval)
-        return best_chrom.applyToPlacement(net_data_base, benchmark)
+        net_data_mod, bench_mod = best_chrom.applyToPlacement(net_data_base, benchmark)
+        return net_data_mod, bench_mod, best_chrom.genes.clone()
 
     def _buildCurtailedConfig(self) -> dict:
         """
@@ -450,7 +507,7 @@ class CometPlacer:
         base_cfg = _loadConfig()
         params   = dict(base_cfg.get("params", {}))
 
-        params["max_iters"]    = self._ga_config.get("curtailed_iters", 300)
+        params["max_iters"]    = self._ga_config.get("ga_curtailed_iters", 300)
         params["hard_spread"]  = False
         params["soft_place"]   = False
         params["legalization"] = "none"
@@ -480,23 +537,29 @@ class CometPlacer:
         plc = _loadPlc(benchmark.name)
         if plc is None:
             print("  [warn] Could not load plc - returning initial placement",
-                  file=sys.stderr)
+                  file=sys.stderr, flush=True)
             return benchmark.macro_positions.clone()
 
         self._out.log("  Building net data...", flush=True)
         net_data = _buildNetData(benchmark, plc)
         if net_data is None:
             print("  [warn] No usable nets - returning initial placement",
-                  file=sys.stderr)
+                  file=sys.stderr, flush=True)
             return benchmark.macro_positions.clone()
         self._out.log(f"  {net_data['num_nets']} nets, {net_data['num_pins']} pins  "
                       f"({net_data['num_skipped']} nets skipped)")
 
-        # ── GA outer loop (optional) ──────────────────────────────────────
-        if _asBool(self._ga_config.get("enabled", False)):
-            net_data, benchmark = self._runGa(benchmark, net_data)
+        # Base net_data (all-N offsets) and gene state — used by rotation optimizer.
+        net_data_base   = net_data
+        current_genes   = torch.zeros(benchmark.num_hard_macros, dtype=torch.int8)
 
-        pos = self._gradientPlace(benchmark, net_data)
+        # ── Orientation pre-search (GA or genetic mode) ───────────────────
+        ga_active = (_asBool(self._ga_config.get("ga_enable", False))
+                     or self.rotation_optimizer == "genetic")
+        if ga_active:
+            net_data, benchmark, current_genes = self._runGa(benchmark, net_data_base)
+
+        pos = self._gradientPlace(benchmark, net_data, net_data_base, current_genes, plc)
 
         full_pos = benchmark.macro_positions.clone()
         full_pos[:benchmark.num_macros] = pos
@@ -511,7 +574,7 @@ class CometPlacer:
     # Gradient descent loop
     # -------------------------------------------------------------------
 
-    def _gradientPlace(self, benchmark, net_data):
+    def _gradientPlace(self, benchmark, net_data, net_data_base=None, current_genes=None, plc=None):
         """
         Combined WL (autograd) + density (analytic) gradient descent.
 
@@ -522,15 +585,32 @@ class CometPlacer:
           4. Zero fixed macros, apply optimizer step
           5. Clamp to canvas, restore fixed positions
           6. Update lambda, decay gamma, check convergence
+
+        net_data_base / current_genes: supplied when rotation_optimizer != "none".
         """
         state = self._initState(benchmark, net_data)
+
+        # For periodic rotation we need a mutable genes tensor and the base offsets.
+        rot_genes = (current_genes.clone()
+                     if current_genes is not None
+                     else torch.zeros(benchmark.num_hard_macros, dtype=torch.int8))
 
         for t in range(self.max_iters):
             should_stop = self._runOneIteration(t, state, benchmark, net_data)
             if should_stop:
                 break
 
-        print(f"  iters={t + 1}")
+            # ── Periodic orientation update ───────────────────────────────
+            if (self.rotation_optimizer == "periodic"
+                    and net_data_base is not None
+                    and t > self.warmup_iters
+                    and t % self.rotation_period == 0):
+                n = _rotation.greedy_rotate(
+                    state["pos"], net_data["offsets"], net_data_base,
+                    rot_genes, benchmark, gamma=state["gamma"],
+                )
+                if n:
+                    self._out.log(f"    [rotation t={t}] {n} macro(s) flipped")
 
         self._out.log(f"  hard_spread={self.hard_spread}  "
                       f"hard_spread_iters={self.hard_spread_iters}")
@@ -550,6 +630,13 @@ class CometPlacer:
             state["pos"] = _legalizer.spiralLegalize(state["pos"], benchmark)
             self._out.saveLegalFrame(t, state["pos"], state["prev_wl"],
                                      state["gamma"], benchmark, state["num_macros"])
+
+        # ── Post-legalization orientation optimizer ───────────────────────
+        if self.rotation_optimizer in ("greedy", "anneal") and net_data_base is not None:
+            self._runRotationOptimizer(
+                state["pos"], net_data, net_data_base, rot_genes, benchmark,
+                state["gamma"], plc
+            )
 
         if self.soft_place and benchmark.num_soft_macros > 0:
             state["pos"] = self._softPlace(state["pos"], benchmark, net_data,
