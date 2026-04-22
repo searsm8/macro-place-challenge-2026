@@ -80,6 +80,21 @@ def _sample_highlight_ids(benchmark, n):
     return set(result)
 
 
+def resolve_highlight_ids(benchmark, named_macros=(), n_random=0):
+    """
+    Resolve macro names / random count to a set of benchmark macro indices.
+    Named macros take priority; falls back to random area-weighted sampling.
+    """
+    name_to_idx = {name: i for i, name in enumerate(benchmark.macro_names)}
+    highlight_ids = set()
+    for macro_name in named_macros:
+        if macro_name in name_to_idx:
+            highlight_ids.add(name_to_idx[macro_name])
+    if not highlight_ids and n_random > 0:
+        highlight_ids = _sample_highlight_ids(benchmark, n_random)
+    return highlight_ids
+
+
 def _annotate_macros_dat(dat_path, highlight_names):
     """
     Rewrite macros.dat in-place, appending '*' to the name of each highlighted
@@ -112,8 +127,8 @@ def parse_args():
                    help="Output GIF path (default: vis/<benchmark>_opt.gif)")
     p.add_argument("--fps", type=float, default=10,
                    help="Frames per second in the GIF (default: 20)")
-    p.add_argument("--step", type=int, default=1,
-                   help="Use every Nth frame, e.g. --step 5 (default: 1 = all frames)")
+    p.add_argument("--step", type=int, default=10,
+                   help="Use every Nth frame, e.g. --step 5 (default: 10)")
     p.add_argument("--dpi", type=int, default=80,
                    help="Render DPI — lower = smaller/faster (default: 80)")
     p.add_argument("--no-nets", dest="draw_nets", action="store_false", default=True,
@@ -132,6 +147,59 @@ def parse_args():
     p.add_argument("--mip-only", action="store_true", default=False,
                    help="Only render the quadratic-init (mIP) frame as a PNG (skip GIF)")
     return p.parse_args()
+
+
+def build_ordered_frames(frames_root, step=1, fps=10, pause_ms=5000):
+    """
+    Build the ordered (frame_data, duration_ms) sequence for a single run.
+
+    Ordering:
+      mIP frame (5 s)  →  phases 2/2.5 (pause at each phase boundary)
+      →  legal frame (5 s)  →  phase 4 (pause at boundary)
+
+    Returns an empty list if no numbered frames are found.
+    """
+    from pathlib import Path as _Path
+    frames_root = _Path(frames_root)
+    duration_ms = int(1000 / fps)
+
+    mip_path   = frames_root / "frame_mip.pt"
+    legal_path = frames_root / "frame_legal.pt"
+
+    num_files = sorted(frames_root.glob("frame_[0-9]*.pt"))[::step]
+    if not num_files:
+        return []
+
+    num_data     = [torch.load(f, weights_only=False) for f in num_files]
+    frame_phases = [d.get("phase", "") for d in num_data]
+
+    split_idx   = next((i for i, p in enumerate(frame_phases) if "4:" in p), len(frame_phases))
+    pre_list    = list(zip(num_data[:split_idx],  frame_phases[:split_idx]))
+    phase4_list = list(zip(num_data[split_idx:],  frame_phases[split_idx:]))
+
+    ordered = []
+
+    if mip_path.exists():
+        mip_data = torch.load(mip_path, weights_only=False)
+        mip_data["phase"] = "1: mIP"  # override in case old runs saved without phase field
+        ordered.append((mip_data, pause_ms))
+
+    for i, (data, phase) in enumerate(pre_list):
+        next_phase  = pre_list[i + 1][1] if i + 1 < len(pre_list) else None
+        at_boundary = next_phase is None or next_phase != phase
+        ordered.append((data, pause_ms if at_boundary else duration_ms))
+
+    if legal_path.exists():
+        legal_data = torch.load(legal_path, weights_only=False)
+        legal_data["phase"] = "3: mLG"  # override in case old runs saved wrong label
+        ordered.append((legal_data, pause_ms))
+
+    for i, (data, phase) in enumerate(phase4_list):
+        next_phase  = phase4_list[i + 1][1] if i + 1 < len(phase4_list) else None
+        at_boundary = next_phase is None or next_phase != phase
+        ordered.append((data, pause_ms if at_boundary else duration_ms))
+
+    return ordered
 
 
 def load_benchmark_for_frames(benchmark_name):
@@ -377,9 +445,11 @@ def main():
             print("  Net edges : not found — nets will not be drawn")
             print("    (run placer with record_frames = true to generate net_edges.pt)")
 
-    # Check for legalized frame
+    # Special frame paths (may or may not exist)
     legal_frame_path = frames_root / "frame_legal.pt"
+    mip_frame_path   = frames_root / "frame_mip.pt"
     has_legal = legal_frame_path.exists()
+    has_mip   = mip_frame_path.exists()
 
     output_path = Path(args.output) if args.output else Path(f"vis/{args.benchmark}_opt.gif")
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -425,7 +495,6 @@ def main():
 
     # --mip-only: render just the mIP (quadratic-init) PNG and exit
     if args.mip_only:
-        mip_frame_path = frames_root / "frame_mip.pt"
         if not mip_frame_path.exists():
             print(f"[error] No frame_mip.pt found in {frames_root}", file=sys.stderr)
             print("  Run the placer with initial_placement = \"quadratic\" and "
@@ -457,71 +526,58 @@ def main():
         print(f"  Saved legalized image: {legal_png_path}")
         return
 
-    frame_files = sorted(frames_root.glob("frame_*.pt"))
-    if not frame_files:
-        print(f"[error] No frame_*.pt files found in {frames_root}", file=sys.stderr)
+    # -- Build ordered sequence -----------------------------------------------
+    duration_ms = int(1000 / args.fps)
+    print("  Scanning phases...", end=" ", flush=True)
+    ordered = build_ordered_frames(frames_root, step=args.step, fps=args.fps)
+    if not ordered:
+        print(f"\n[error] No numbered frame_*.pt files found in {frames_root}", file=sys.stderr)
         sys.exit(1)
+    print(f"done  ({len(ordered)} entries)")
 
-    # Apply step subsampling
-    frame_files = frame_files[::args.step]
-    n_frames = len(frame_files)
-
+    n_frames = len(ordered)
     print(f"  Benchmark : {args.benchmark}")
     print(f"  Frames    : {n_frames}  (step={args.step})")
     print(f"  FPS       : {args.fps}")
     print(f"  Output    : {output_path}")
     if net_edges is not None:
         print(f"  Nets      : {net_edges['num_nets']}  alpha={args.net_alpha}")
-    if has_legal:
-        print(f"  Legal frame: {legal_frame_path}")
-    else:
-        print("  Legal frame: not found — legalized placement will not be appended")
+    print(f"  mIP frame : {'yes (phase 1, 5 s pause)' if has_mip else 'not found — skipped'}")
+    print(f"  Legal frame: {'yes (phase 3, between ph2 and ph4, 5 s pause)' if has_legal else 'not found — skipped'}")
+    print(f"  Total      : {n_frames} entries (incl. phase pauses)")
     print()
 
-    # Render each frame to a temporary PNG, collect PIL Images
-    pil_frames = []
+    # -- Render each entry to a temporary PNG, collect PIL Images -------------
+    pil_frames      = []
     frame_durations = []
-    duration_ms = int(1000 / args.fps)
     with tempfile.TemporaryDirectory() as tmpdir:
-        for i, fpath in enumerate(frame_files):
-            frame_data = torch.load(fpath, weights_only=False)
+        for i, (frame_data, dur) in enumerate(ordered):
             png_path = Path(tmpdir) / f"frame_{i:05d}.png"
-
             render_frame(frame_data, benchmark, net_edges, args.net_alpha,
                          str(png_path), args.dpi,
                          highlight_ids=highlight_ids or None)
+            pil_frames.append(Image.open(png_path).copy())
+            frame_durations.append(dur)
 
-            pil_frames.append(Image.open(png_path).copy())  # copy before tmpdir cleanup
-            frame_durations.append(duration_ms)
-
-            # Progress bar
             pct = (i + 1) / n_frames * 100
             bar = "#" * int(pct / 2)
             print(f"\r  Rendering [{bar:<50}] {pct:5.1f}%  ({i+1}/{n_frames})",
                   end="", flush=True)
 
+        # Standalone high-res PNG of the legalized design
         if has_legal:
-            frame_data = torch.load(legal_frame_path, weights_only=False)
-            frame_data["iter_label"] = "legal"
-            png_path = Path(tmpdir) / "frame_legal.png"
-            render_frame(frame_data, benchmark, net_edges, args.net_alpha,
-                         str(png_path), args.dpi,
-                         highlight_ids=highlight_ids or None)
-            pil_frames.append(Image.open(png_path).copy())
-            frame_durations.append(5000)  # 5-second pause on the final frame
-
-            # Save standalone high-res PNG of the legalized design
             legal_png_path = output_path.with_name(
                 output_path.stem.replace("_opt", "") + "_legal.png"
             )
-            render_frame(frame_data, benchmark, net_edges, args.net_alpha,
+            render_frame(torch.load(legal_frame_path, weights_only=False),
+                         benchmark, net_edges, args.net_alpha,
                          str(legal_png_path), dpi=150,
                          highlight_ids=highlight_ids or None)
             print(f"\n  Saved legalized image: {legal_png_path}")
 
     print()  # newline after progress bar
 
-    # Stitch into GIF with PIL
+    # -- Stitch into GIF with PIL ---------------------------------------------
     print(f"  Writing GIF ({duration_ms}ms/frame)...", end=" ", flush=True)
     pil_frames[0].save(
         output_path,

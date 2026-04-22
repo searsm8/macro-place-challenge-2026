@@ -141,12 +141,12 @@ class OutputManager:
         if num_nets > 1:
             first_pin[1:] = counts[:-1].cumsum(0)
         torch.save({
-            "macro_ids": net_data["macro_ids"],
-            "offsets": net_data["offsets"],
-            "net_ids": net_ids_t,
-            "is_macro": net_data["is_macro"],
+            "macro_ids": net_data["macro_ids"].cpu(),
+            "offsets": net_data["offsets"].cpu(),
+            "net_ids": net_ids_t.cpu(),
+            "is_macro": net_data["is_macro"].cpu(),
             "num_nets": num_nets,
-            "first_pin_idx": first_pin,
+            "first_pin_idx": first_pin.cpu(),
         }, frames_dir / "net_edges.pt")
         self.log(f"  Net topology    -> {frames_dir}/net_edges.pt")
         self._bench_frames_dir = frames_dir
@@ -180,7 +180,7 @@ class OutputManager:
             return
         torch.save({
             "iter": iter_num,
-            "positions": pos.detach().clone(),
+            "positions": pos.detach().cpu().clone(),
             "wl_loss": wl_val,
             "den_loss": den_energy,
             "overflow": overflow,
@@ -191,7 +191,7 @@ class OutputManager:
             "benchmark_name": benchmark.name,
             "canvas_width": float(benchmark.canvas_width),
             "canvas_height": float(benchmark.canvas_height),
-            "macro_sizes": benchmark.macro_sizes[:num_macros].clone(),
+            "macro_sizes": benchmark.macro_sizes[:num_macros].cpu().clone(),
             "num_hard": benchmark.num_hard_macros,
         }, self._bench_frames_dir / f"frame_{iter_num:05d}.pt")
 
@@ -201,7 +201,7 @@ class OutputManager:
             return
         torch.save({
             "iter": -1,
-            "positions": pos.detach().clone(),
+            "positions": pos.detach().cpu().clone(),
             "wl_loss": 0.0,
             "den_loss": 0.0,
             "overflow": float("inf"),
@@ -212,7 +212,7 @@ class OutputManager:
             "benchmark_name": benchmark.name,
             "canvas_width": float(benchmark.canvas_width),
             "canvas_height": float(benchmark.canvas_height),
-            "macro_sizes": benchmark.macro_sizes[:num_macros].clone(),
+            "macro_sizes": benchmark.macro_sizes[:num_macros].cpu().clone(),
             "num_hard": benchmark.num_hard_macros,
         }, self._bench_frames_dir / "frame_mip.pt")
 
@@ -223,7 +223,7 @@ class OutputManager:
             return
         torch.save({
             "iter": iter_num,
-            "positions": pos.detach().clone(),
+            "positions": pos.detach().cpu().clone(),
             "wl_loss": wl_val,
             "den_loss": 0.0,
             "overflow": 0.0,
@@ -234,7 +234,7 @@ class OutputManager:
             "benchmark_name": benchmark.name,
             "canvas_width": float(benchmark.canvas_width),
             "canvas_height": float(benchmark.canvas_height),
-            "macro_sizes": benchmark.macro_sizes[:num_macros].clone(),
+            "macro_sizes": benchmark.macro_sizes[:num_macros].cpu().clone(),
             "num_hard": benchmark.num_hard_macros,
         }, self._bench_frames_dir / "frame_legal.pt")
 

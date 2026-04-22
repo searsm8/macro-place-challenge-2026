@@ -159,7 +159,7 @@ def _buildDensityMapExact(pos, benchmark, target_density, density_mask=None,
     bin_w = canvas_w / cols
     bin_h = canvas_h / rows
 
-    real_sizes = benchmark.macro_sizes[:num_macros].to(pos.dtype)  # [n, 2]
+    real_sizes = benchmark.macro_sizes[:num_macros].to(device=pos.device, dtype=pos.dtype)  # [n, 2]
 
     # Inflate hard macro footprints by (1 + halo_size) before masking so the
     # hard/soft classification survives density_mask filtering below.
@@ -194,8 +194,8 @@ def _buildDensityMapExact(pos, benchmark, target_density, density_mask=None,
     y_hi = density_pos[:, 1] + clamp_h / 2
 
     # Bin edges
-    bx_edges = torch.linspace(0.0, canvas_w, cols + 1, dtype=pos.dtype)
-    by_edges = torch.linspace(0.0, canvas_h, rows + 1, dtype=pos.dtype)
+    bx_edges = torch.linspace(0.0, canvas_w, cols + 1, dtype=pos.dtype, device=pos.device)
+    by_edges = torch.linspace(0.0, canvas_h, rows + 1, dtype=pos.dtype, device=pos.device)
 
     # Overlap in x: [n, cols] and y: [n, rows]
     overlap_x = (torch.min(x_hi.unsqueeze(1), bx_edges[1:].unsqueeze(0))
@@ -372,10 +372,10 @@ def _densityGradientBell(pos, benchmark, target_density):
     bin_w = canvas_w / cols
     bin_h = canvas_h / rows
 
-    bin_cx = torch.linspace(bin_w / 2, canvas_w - bin_w / 2, cols, dtype=pos_var.dtype)
-    bin_cy = torch.linspace(bin_h / 2, canvas_h - bin_h / 2, rows, dtype=pos_var.dtype)
+    bin_cx = torch.linspace(bin_w / 2, canvas_w - bin_w / 2, cols, dtype=pos_var.dtype, device=pos_var.device)
+    bin_cy = torch.linspace(bin_h / 2, canvas_h - bin_h / 2, rows, dtype=pos_var.dtype, device=pos_var.device)
 
-    macro_sizes = benchmark.macro_sizes[:num_macros].to(pos_var.dtype)
+    macro_sizes = benchmark.macro_sizes[:num_macros].to(device=pos_var.device, dtype=pos_var.dtype)
     width = macro_sizes[:, 0].unsqueeze(1)
     height = macro_sizes[:, 1].unsqueeze(1)
 

@@ -33,22 +33,26 @@ SWEEP = {
     #"target_density": [0.50, 0.80],
     #"initial_spread": [0.01, 0.04, 0.15],
     #"lambda_hm_init": [1, 2, 3, 20],
-    # "warmup_iters": [10, 20, 40],
+    #"warmup_iters": [0, 1, 10, 20, 40],
     #"optimizer": ["sgd", "bb_sgd", "nesterov"],
-    "stop_overflow": [0.05, 0.07, .08, .09, .1],
     #"halo_size": [ 0.3, 0.4, 0.5, 0.6],
     #"halo_size": [ 0.2, 0.3, 0.4, 0.5],
     #"halo_legalize": [0.1, 0.15],
 
     #"lambda_pcof_upper": [1.03, 1.05],
     #"soft_place": ["False", "True"],
-    #"initial_placement": ["center", "quadratic"],
-    #"density_weight": [8e-3, 1.6e-2, 8e-2, 8e-1],
+    #"initial_placement": ["none", "center", "quadratic"],
+    #"initial_placement": ["none", "quadratic"],
+    #"density_weight": [8e-2, 1.6e-1, 3.2e-1, 6.4e-1],
     #"hard_spread": ["False", "True"],
     #"hard_spread_iters": [0, 50],
     #"ga_enable": ["False", "True"],
     #"curtailed_iters": [300, 500, 700, 900]
-    #"rotation*_optimizer": ["none", "greedy"],
+
+    #"stop_overflow": [0.03, 0.04, .05],
+    "rotation_optimizer": ["none", "greedy"],
+    #"use_gpu": ["False", "True"],
+    "deterministic": ["False","False","True","True"],
 }
 # ─────────────────────────────────────────────────────────────────────────────
 

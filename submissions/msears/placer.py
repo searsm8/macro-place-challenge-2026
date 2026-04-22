@@ -3,14 +3,19 @@ CometPlacer — Analytical WA HPWL + Density Gradient Descent
 
 A PyTorch-based analytical placer inspired by DREAMplace (Lin et al. DAC 2019)
 and ePlace (Lu et al. DAC 2015).
-Two phases:
-  1. Global placement — gradient descent on smooth WA HPWL + density force
-  2. Legalization — spiral push-out to remove hard-macro overlaps
+
+Placement phases:
+  1. mIP  — macro initial placement (quadratic WL, center scatter, or benchmark default)
+  2. mGP  — mixed global placement: WA HPWL + electrostatic density gradient descent
+  2.5     — hard-macro spread: soft macros excluded from density, hard macros spread freely
+  3. mLG  — macro legalization: bump or spiral push-out to remove hard-macro overlaps
+  3.5     — post-legalization rotation optimizer (greedy or SA)
+  4. cGP  — cell global placement: hard macros fixed, soft macros re-optimized
 
 Module structure:
-  placer.py    — entry point, gradient loop, optimizer, lambda schedule
+  placer.py    — entry point, phase pipeline, optimizer, lambda schedule
   density.py   — density gradient (bell + electrostatic)
-  legalizer.py — spiral legalization
+  legalizer.py — macro legalization (bump, spiral)
   output.py    — console logging, frame snapshots, iteration CSV
 """
 
@@ -335,10 +340,14 @@ class CometPlacer:
         # Populated after each placement; consumed by the GA fitness oracle.
         self.last_metrics: dict = {}
 
+        use_gpu = cfg.get("params", {}).get("use_gpu", True)
+        self.device = torch.device("cuda" if (use_gpu and torch.cuda.is_available()) else "cpu")
+
     def _readAlgorithmParams(self, p):
         self.max_iters = p.get("max_iters", 2000)
         self.soft_place_iters = p.get("soft_place_iters", 1000)
         self.seed = p.get("seed", 42)
+        self.deterministic = _asBool(p.get("deterministic", False))
         self.gamma = None if p.get("gamma", "auto") == "auto" else float(p["gamma"])
         self.max_step = None if p.get("max_step", "auto") == "auto" else float(p["max_step"])
         self.gamma_decay = p.get("gamma_decay", 0.98)
@@ -362,6 +371,12 @@ class CometPlacer:
         self.sa_T_init           = p.get("sa_T_init", 1e-4)
         self.sa_T_final          = p.get("sa_T_final", 1e-7)
         self.sa_steps_per_macro  = p.get("sa_steps_per_macro", 200)
+        _cand_map = {
+            "NS":       (0, 2),
+            "no-swap":  (0, 1, 2, 3),
+            "all":      (0, 1, 2, 3, 4, 5, 6, 7),
+        }
+        self.rotation_candidates = _cand_map[p.get("rotation_candidates", "all")]
 
     def _readLambdaParams(self, p):
         self.lambda_schedule = p.get("lambda_schedule", "hpwl")
@@ -410,7 +425,7 @@ class CometPlacer:
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
 
-        pos = self._gradientPlace(benchmark, net_data)
+        pos = self._runPlacementPipeline(benchmark, net_data)
 
         full_pos = benchmark.macro_positions.clone()
         full_pos[:benchmark.num_macros] = pos
@@ -430,23 +445,36 @@ class CometPlacer:
         Call the appropriate rotation function (greedy or SA), log results,
         then sync the chosen orientations back into the plc object so the
         harness evaluator sees the rotated pin positions.
+
+        All 8 orientations (N, FN, S, FS, E, FE, W, FW) are safe to use:
+        - plc.update_macro_orientation only rotates pin offsets, never swaps
+          macro dimensions, so legalized positions remain overlap-free.
+        - The harness validates overlaps against original macro_sizes and has
+          no concept of orientation — it cannot flag rotated macros as illegal.
+        - _OUR_ORI_TO_PLC maps our rotation-matrix indices to the plc names,
+          correcting for the opposite direction convention of E/W.
         """
-        prev_genes = genes.clone()
-        candidates = (0, 2)   # N and S only — correct plc mapping, no size swap
+        candidates = self.rotation_candidates
+        # net_data_base is always CPU; rotation ops must run on a consistent device.
+        # Work on CPU copies of pos and work_offs, then sync work_offs back.
+        pos_cpu      = pos.detach().cpu()
+        work_offs_dev = net_data["offsets"]                  # may be on CUDA
+        work_offs_cpu = work_offs_dev.cpu().clone()
 
         mode = self.rotation_optimizer
         if mode == "greedy":
             n = _rotation.greedy_rotate(
-                pos, net_data["offsets"], net_data_base,
+                pos_cpu, work_offs_cpu, net_data_base,
                 genes, benchmark, gamma=gamma,
                 n_passes=self.rotation_passes,
                 candidates=candidates,
             )
-            self._out.log(f"  Rotation (greedy, {self.rotation_passes} pass): {n} macro(s) flipped")
+            self._out.log(f"  Rotation (greedy, {self.rotation_passes} pass, "
+                          f"cands={candidates}): {n} macro(s) flipped")
         elif mode == "anneal":
             n_steps = self.sa_steps_per_macro * benchmark.num_hard_macros
             n = _rotation.sa_rotate(
-                pos, net_data["offsets"], net_data_base,
+                pos_cpu, work_offs_cpu, net_data_base,
                 genes, benchmark, gamma=gamma,
                 n_steps=n_steps,
                 T_init=self.sa_T_init,
@@ -454,18 +482,30 @@ class CometPlacer:
                 candidates=candidates,
             )
             self._out.log(
-                f"  Rotation (SA, {n_steps} steps, T {self.sa_T_init:.1e}→{self.sa_T_final:.1e}): "
-                f"{n} accepted"
+                f"  Rotation (SA, {n_steps} steps, T {self.sa_T_init:.1e}→{self.sa_T_final:.1e}, "
+                f"cands={candidates}): {n} accepted"
             )
 
-        # Sync changed orientations back to plc so harness sees rotated pin positions.
-        # Uses _OUR_ORI_TO_PLC to map our index → correct plc orientation name.
+        # Sync rotated offsets back to the original device tensor.
+        work_offs_dev.copy_(work_offs_cpu.to(work_offs_dev.device))
+
+        # Swap macro_sizes w↔h for E/W-oriented macros (orientations 4-7 transpose).
+        for m in range(benchmark.num_hard_macros):
+            if int(genes[m]) >= 4:
+                w = benchmark.macro_sizes[m, 0].clone()
+                benchmark.macro_sizes[m, 0] = benchmark.macro_sizes[m, 1]
+                benchmark.macro_sizes[m, 1] = w
+
+        # Sync all non-N orientations to plc so harness sees rotated pin positions.
+        # Assumes plc is in N orientation when this is called (true because _loadPlc()
+        # returns a freshly-loaded plc, and update_macro_orientation is cumulative).
+        # update_macro_orientation("N") is a no-op in the plc, so we skip N genes.
         if plc is not None:
             for m in range(benchmark.num_hard_macros):
-                if int(genes[m]) != int(prev_genes[m]):
-                    plc_idx  = plc.hard_macro_indices[m]
-                    plc_name = self._OUR_ORI_TO_PLC[int(genes[m])]
-                    plc.update_macro_orientation(plc_idx, plc_name)
+                gene = int(genes[m])
+                if gene != 0:
+                    plc_idx = plc.hard_macro_indices[m]
+                    plc.update_macro_orientation(plc_idx, self._OUR_ORI_TO_PLC[gene])
 
     # -------------------------------------------------------------------
     # GA helpers
@@ -501,7 +541,7 @@ class CometPlacer:
         - Inherits all [params] from the current placer (same density method,
           optimizer, lambda schedule, etc.)
         - Overrides max_iters with ga.curtailed_iters
-        - Disables phases 2.5 / 4 and legalization
+        - Disables phase 2.5 (hard spread) and phase 4 (cGP) and legalization
         - Silences all output and frame recording
         """
         base_cfg = _loadConfig()
@@ -529,7 +569,18 @@ class CometPlacer:
 
     def place(self, benchmark):
         torch.manual_seed(self.seed)
+        # Seed the CUDA RNG explicitly — torch.manual_seed() alone may not cover it
+        # on all PyTorch versions.
+        if self.device.type == "cuda":
+            torch.cuda.manual_seed(self.seed)
         np.random.seed(self.seed)
+
+        if self.deterministic:
+            # Must be set before CUDA initializes; harmless if already set.
+            os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+            torch.use_deterministic_algorithms(True)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
         start_time = time.time()
 
         _output.printBenchmarkInfo(benchmark, self.density_method)
@@ -559,7 +610,7 @@ class CometPlacer:
         if ga_active:
             net_data, benchmark, current_genes = self._runGa(benchmark, net_data_base)
 
-        pos = self._gradientPlace(benchmark, net_data, net_data_base, current_genes, plc)
+        pos = self._runPlacementPipeline(benchmark, net_data, net_data_base, current_genes, plc)
 
         full_pos = benchmark.macro_positions.clone()
         full_pos[:benchmark.num_macros] = pos
@@ -574,33 +625,61 @@ class CometPlacer:
     # Gradient descent loop
     # -------------------------------------------------------------------
 
-    def _gradientPlace(self, benchmark, net_data, net_data_base=None, current_genes=None, plc=None):
-        """
-        Combined WL (autograd) + density (analytic) gradient descent.
+    def _runPlacementPipeline(self, benchmark, net_data, net_data_base=None, current_genes=None, plc=None):
+        """Orchestrates all placement phases: mGP → hard spread → mLG → rotation → cGP."""
+        net_data = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                    for k, v in net_data.items()}
 
-        Per iteration:
-          1. WL forward+backward -> wl_grad
-          2. Density gradient -> den_grad (skipped in warmup)
-          3. Combined: grad = wl_grad + lambda * den_grad
-          4. Zero fixed macros, apply optimizer step
-          5. Clamp to canvas, restore fixed positions
-          6. Update lambda, decay gamma, check convergence
-
-        net_data_base / current_genes: supplied when rotation_optimizer != "none".
-        """
         state = self._initState(benchmark, net_data)
-
-        # For periodic rotation we need a mutable genes tensor and the base offsets.
         rot_genes = (current_genes.clone()
                      if current_genes is not None
                      else torch.zeros(benchmark.num_hard_macros, dtype=torch.int8))
 
+        # Phase 2: mGP
+        last_t = self._mixedGlobalPlacement(state, benchmark, net_data, rot_genes, net_data_base)
+
+        # Phase 2.5: hard-macro spread
+        self._out.log(f"  hard_spread={self.hard_spread}  "
+                      f"hard_spread_iters={self.hard_spread_iters}")
+        if self.hard_spread and benchmark.num_soft_macros > 0:
+            last_t = self._hardMacroSpread(state, benchmark, net_data, frame_offset=last_t + 1)
+
+        self._out.close()
+
+
+        # Phase 3.5: pre-legalization rotation optimizer
+        if self.rotation_optimizer in ("greedy", "anneal") and net_data_base is not None:
+            self._runRotationOptimizer(
+                state["pos"], net_data, net_data_base, rot_genes, benchmark,
+                state["gamma"], plc
+            )
+
+        # Phase 3: mLG
+        self._macroLegalization(state, last_t, benchmark)
+
+        # Phase 4: cGP
+        if self.soft_place and benchmark.num_soft_macros > 0:
+            state["pos"] = self._cellGlobalPlacement(state["pos"], benchmark, net_data,
+                                                     frame_offset=last_t + 1)
+            self._out.saveLegalFrame(last_t, state["pos"], state["prev_wl"],
+                                     state["gamma"], benchmark, state["num_macros"],
+                                     phase="3: mLG")
+
+        self.last_metrics = {
+            "wl": float(state["prev_wl"]),
+            "overflow": float(
+                state["overflow_history"][-1] if state["overflow_history"] else 1.0
+            ),
+        }
+        return state["pos"].cpu()
+
+    def _mixedGlobalPlacement(self, state, benchmark, net_data, rot_genes, net_data_base=None):
+        """Phase 2 (mGP): WA HPWL + electrostatic density gradient descent main loop."""
         for t in range(self.max_iters):
             should_stop = self._runOneIteration(t, state, benchmark, net_data)
             if should_stop:
                 break
 
-            # ── Periodic orientation update ───────────────────────────────
             if (self.rotation_optimizer == "periodic"
                     and net_data_base is not None
                     and t > self.warmup_iters
@@ -611,52 +690,26 @@ class CometPlacer:
                 )
                 if n:
                     self._out.log(f"    [rotation t={t}] {n} macro(s) flipped")
+        return t
 
-        self._out.log(f"  hard_spread={self.hard_spread}  "
-                      f"hard_spread_iters={self.hard_spread_iters}")
-        if self.hard_spread and benchmark.num_soft_macros > 0:
-            t = self._hardSpreadPhase(state, benchmark, net_data, frame_offset=t + 1)
-
-        self._out.close()
-
+    def _macroLegalization(self, state, last_t, benchmark):
+        """Phase 3 (mLG): remove hard-macro overlaps via bump or spiral push-out."""
         if self.legalization == "bump":
             self._out.log("  Legalizing (pairwise bump)...")
             state["pos"] = _legalizer.bumpLegalize(
-                state["pos"], benchmark, halo_size=self.halo_legalize)
-            self._out.saveLegalFrame(t, state["pos"], state["prev_wl"],
+                state["pos"].cpu(), benchmark, halo_size=self.halo_legalize
+            ).to(self.device)
+            self._out.saveLegalFrame(last_t, state["pos"], state["prev_wl"],
                                      state["gamma"], benchmark, state["num_macros"])
         elif self.legalization == "spiral":
             self._out.log("  Legalizing (spiral push-out)...")
-            state["pos"] = _legalizer.spiralLegalize(state["pos"], benchmark)
-            self._out.saveLegalFrame(t, state["pos"], state["prev_wl"],
+            state["pos"] = _legalizer.spiralLegalize(
+                state["pos"].cpu(), benchmark
+            ).to(self.device)
+            self._out.saveLegalFrame(last_t, state["pos"], state["prev_wl"],
                                      state["gamma"], benchmark, state["num_macros"])
 
-        # ── Post-legalization orientation optimizer ───────────────────────
-        if self.rotation_optimizer in ("greedy", "anneal") and net_data_base is not None:
-            self._runRotationOptimizer(
-                state["pos"], net_data, net_data_base, rot_genes, benchmark,
-                state["gamma"], plc
-            )
-
-        if self.soft_place and benchmark.num_soft_macros > 0:
-            state["pos"] = self._softPlace(state["pos"], benchmark, net_data,
-                                           frame_offset=t + 1)
-            # Overwrite frame_legal.pt so the GIF ends on the phase 4 result
-            self._out.saveLegalFrame(t, state["pos"], state["prev_wl"],
-                                     state["gamma"], benchmark, state["num_macros"],
-                                     phase="4: cGP")
-
-        # Expose final metrics for external callers (e.g. GA fitness oracle).
-        self.last_metrics = {
-            "wl": float(state["prev_wl"]),
-            "overflow": float(
-                state["overflow_history"][-1] if state["overflow_history"] else 1.0
-            ),
-        }
-
-        return state["pos"]
-
-    def _hardSpreadPhase(self, state, benchmark, net_data, frame_offset=0):
+    def _hardMacroSpread(self, state, benchmark, net_data, frame_offset=0):
         """
         Phase 2.5: let hard macros spread before legalization.
 
@@ -724,7 +777,7 @@ class CometPlacer:
         self._out.log(f"  [2.5] done  iters={self.hard_spread_iters}")
         return last_t
 
-    def _softPlace(self, pos, benchmark, net_data, frame_offset=0):
+    def _cellGlobalPlacement(self, pos, benchmark, net_data, frame_offset=0):
         """
         Phase 4 (cGP): soft-macro global placement after hard-macro legalization.
 
@@ -741,11 +794,11 @@ class CometPlacer:
         canvas_diag = max(canvas_w, canvas_h)
 
         # Lock all hard macros (originally-fixed ones already set; add the rest)
-        fixed_mask = benchmark.macro_fixed.clone()
+        fixed_mask = benchmark.macro_fixed.clone().to(self.device)
         fixed_mask[:benchmark.num_hard_macros] = True
 
-        half_w = benchmark.macro_sizes[:num_macros, 0] / 2
-        half_h = benchmark.macro_sizes[:num_macros, 1] / 2
+        half_w = benchmark.macro_sizes[:num_macros, 0].to(self.device) / 2
+        half_h = benchmark.macro_sizes[:num_macros, 1].to(self.device) / 2
 
         # Restart gamma and step size fresh for this phase
         gamma = canvas_diag / 8.0
@@ -767,7 +820,7 @@ class CometPlacer:
             "init_pos": pos.clone(),  # _clampPositions restores fixed macros to this
             "lambda_d": 0.0,
             "lambda_hm": 1.0,         # no hard-macro boost; they're fixed anyway
-            "hard_mask": benchmark.get_hard_macro_mask(),
+            "hard_mask": benchmark.get_hard_macro_mask().to(self.device),
             "best_wl": float("inf"),
             "best_pos": pos.clone(),
             "prev_wl": float("inf"),
@@ -811,7 +864,7 @@ class CometPlacer:
 
             with torch.no_grad():
                 grad[fixed_mask] = 0.0
-                self._stepSgd(grad, state)
+                alpha = self._stepSgd(grad, state)
 
             self._trackBestWl(wl_val, state)
             self._updateLambda(t, wl_val, wl_grad, den_grad, den_energy, state,
@@ -829,7 +882,7 @@ class CometPlacer:
             state["prev_overflow"] = overflow
 
             self._out.saveFrame(t + frame_offset, state["pos"], wl_val, den_energy,
-                                overflow, state["lambda_d"], 0.0, state["gamma"],
+                                overflow, state["lambda_d"], alpha, state["gamma"],
                                 benchmark, state["num_macros"], phase="4: cGP")
 
             if converged:
@@ -849,18 +902,18 @@ class CometPlacer:
         max_step = self.max_step or canvas_diag * 0.005
         gamma_min = canvas_diag * self.gamma_min_frac
 
-        fixed_mask = benchmark.macro_fixed[:num_macros]
-        half_w = benchmark.macro_sizes[:num_macros, 0] / 2
-        half_h = benchmark.macro_sizes[:num_macros, 1] / 2
+        fixed_mask = benchmark.macro_fixed[:num_macros].to(self.device)
+        half_w = benchmark.macro_sizes[:num_macros, 0].to(self.device) / 2
+        half_h = benchmark.macro_sizes[:num_macros, 1].to(self.device) / 2
 
         precond = self._buildPreconditioner(benchmark, net_data, num_macros)
 
-        # Set up frame directory before _initPositions so we can save an mIP frame.
+        # Set up frame directory before _initialPlacement so we can save an mIP frame.
         self._out.setupFrames(benchmark, net_data)
         self._out.openIterLog(benchmark)
 
-        pos = self._initPositions(benchmark, net_data, num_macros,
-                                  canvas_w, canvas_h, half_w, half_h)
+        pos = self._initialPlacement(benchmark, net_data, num_macros,
+                                    canvas_w, canvas_h, half_w, half_h)
         if self.init_placement == "quadratic":
             self._out.saveMipFrame(pos, benchmark, num_macros)
         init_pos = pos.clone()
@@ -880,7 +933,7 @@ class CometPlacer:
             "init_pos": init_pos,
             "lambda_d": 0.0,
             "lambda_hm": self.lambda_hm_init,
-            "hard_mask": benchmark.get_hard_macro_mask(),
+            "hard_mask": benchmark.get_hard_macro_mask().to(self.device),
             "best_wl": float("inf"),
             "best_pos": pos.clone(),
             "prev_wl": float("inf"),
@@ -902,24 +955,24 @@ class CometPlacer:
         if not self.use_precond:
             return None
         macro_area = (benchmark.macro_sizes[:num_macros, 0]
-                      * benchmark.macro_sizes[:num_macros, 1]).float()
-        net_degree = torch.zeros(num_macros, dtype=torch.float32)
+                      * benchmark.macro_sizes[:num_macros, 1]).float().to(self.device)
+        net_degree = torch.zeros(num_macros, dtype=torch.float32, device=self.device)
         macro_ids_t = net_data["macro_ids"]
         is_macro_t = net_data["is_macro"].float()
         net_degree.scatter_add_(0, macro_ids_t.clamp(min=0), is_macro_t)
         return (macro_area + net_degree).clamp(min=1.0).unsqueeze(1)
 
-    def _initPositions(self, benchmark, net_data, num_macros,
-                       canvas_w, canvas_h, half_w, half_h):
+    def _initialPlacement(self, benchmark, net_data, num_macros,
+                          canvas_w, canvas_h, half_w, half_h):
         """Set initial macro positions (from benchmark, center scatter, or quadratic WL)."""
-        pos = benchmark.macro_positions[:num_macros].clone().float()
+        pos = benchmark.macro_positions[:num_macros].clone().float().to(self.device)
         if self.init_placement == "center":
             spread_r = self.init_spread ** 0.5
             cx, cy = canvas_w / 2.0, canvas_h / 2.0
             half_bx = canvas_w * spread_r / 2.0
             half_by = canvas_h * spread_r / 2.0
-            pos[:, 0] = torch.empty(num_macros).uniform_(cx - half_bx, cx + half_bx)
-            pos[:, 1] = torch.empty(num_macros).uniform_(cy - half_by, cy + half_by)
+            pos[:, 0] = torch.empty(num_macros, device=self.device).uniform_(cx - half_bx, cx + half_bx)
+            pos[:, 1] = torch.empty(num_macros, device=self.device).uniform_(cy - half_by, cy + half_by)
             pos[:, 0] = pos[:, 0].clamp(half_w, canvas_w - half_w)
             pos[:, 1] = pos[:, 1].clamp(half_h, canvas_h - half_h)
         elif self.init_placement == "quadratic":
@@ -927,7 +980,10 @@ class CometPlacer:
             cfg = {"quad_b2b_iters": self.quad_b2b_iters,
                    "quad_net_size_threshold": self.quad_net_size_threshold}
             self._out.log("  Quadratic WL init (mIP)...", flush=True)
-            pos = _qp.quadratic_init(net_data, benchmark, cfg)
+            # quadratic_placer uses numpy/scipy and requires CPU tensors.
+            cpu_net_data = {k: v.cpu() if isinstance(v, torch.Tensor) else v
+                            for k, v in net_data.items()}
+            pos = _qp.quadratic_init(cpu_net_data, benchmark, cfg).to(self.device)
             self._out.log(f"  mIP done.")
         return pos
 
@@ -951,7 +1007,8 @@ class CometPlacer:
         else:
             opt_info = f"sgd  max_step={state['max_step']:.4f}"
         self._out.log(
-            f"  Gradient descent: {self.max_iters} iters  "
+            f"  Device: {self.device}  "
+            f"Gradient descent: {self.max_iters} iters  "
             f"gamma0={state['gamma']:.3f}  gamma_min={state['gamma_min']:.4f}  "
             f"warmup={self.warmup_iters}  stop_overflow={self.stop_overflow}  "
             f"optimizer={opt_info}")
@@ -1059,9 +1116,9 @@ class CometPlacer:
     def _stepSgd(self, grad, state):
         """SGD with per-macro gradient clipping."""
         per_macro_norm = grad.norm(dim=1, keepdim=True).clamp(min=1e-8)
-        alpha = per_macro_norm[~state["fixed_mask"]].mean().item()
         scale = (state["max_step"] / per_macro_norm).clamp(max=1.0)
         clipped_grad = grad * scale
+        alpha = (per_macro_norm * scale)[~state["fixed_mask"]].mean().item()
 
         state["pos"] = state["pos"].detach() - clipped_grad
         self._clampPositions(state)
@@ -1092,9 +1149,11 @@ class CometPlacer:
         if state["g_prev"] is not None:
             s_k = eval_flat - state["v_prev"]
             y_k = g_flat - state["g_prev"]
-            sy = torch.dot(s_k, y_k).item()
-            yy = torch.dot(y_k, y_k).item()
-            ss = torch.dot(s_k, s_k).item()
+            # torch.dot delegates to cuBLAS sdot, which crashes with SIGFPE on some
+            # CUDA driver versions. (a * b).sum() is identical but avoids cuBLAS.
+            sy = (s_k * y_k).sum().item()
+            yy = (y_k * y_k).sum().item()
+            ss = (s_k * s_k).sum().item()
             if sy > 0.0 and yy > 1e-20:
                 alpha = sy / yy                              # short BB
             elif ss > 1e-20 and yy > 1e-20:

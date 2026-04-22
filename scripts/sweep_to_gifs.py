@@ -87,12 +87,12 @@ def parse_args():
                         "(e.g. -b ibm01 ibm03 ibm06)")
     p.add_argument("--fps", type=float, default=10,
                    help="Frames per second (default: 10)")
-    p.add_argument("--step", type=int, default=5,
-                   help="Render every Nth frame (default: 5)")
+    p.add_argument("--step", type=int, default=10,
+                   help="Render every Nth frame (default: 10)")
     p.add_argument("--dpi", type=int, default=80,
                    help="Render DPI (default: 80)")
-    p.add_argument("--net-alpha", type=float, default=0.05,
-                   help="Net line opacity (default: 0.05)")
+    p.add_argument("--net-alpha", type=float, default=0.2,
+                   help="Net line opacity (default: 0.2)")
     p.add_argument("--no-nets", dest="draw_nets", action="store_false", default=True,
                    help="Disable net lines")
     p.add_argument("--skip-existing", action="store_true", default=False,
@@ -123,8 +123,8 @@ def render_run(
         if net_edges_path.exists():
             net_edges = torch.load(net_edges_path, weights_only=False)
 
-    frame_files = sorted(frames_root.glob("frame_*.pt"))[::args.step]
-    if not frame_files:
+    ordered = ftg.build_ordered_frames(frames_root, step=args.step, fps=args.fps)
+    if not ordered:
         print(f"  skip  {run_dir.relative_to(REPO_ROOT)}  (no frames after step={args.step})")
         return False, benchmark
 
@@ -135,30 +135,21 @@ def render_run(
             print(f"  ERROR loading benchmark '{bench_name}': {exc}")
             return False, None
 
-    legal_frame_path = frames_root / "frame_legal.pt"
-    has_legal        = legal_frame_path.exists()
-    duration_ms      = int(1000 / args.fps)
+    cfg_names, cfg_n_random = ftg._load_visualizer_config()
+    highlight_ids = ftg.resolve_highlight_ids(benchmark, cfg_names, cfg_n_random) or None
 
     pil_frames: list[Image.Image] = []
     frame_durations: list[int]    = []
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
-        for i, fpath in enumerate(frame_files):
-            frame_data = torch.load(fpath, weights_only=False)
-            png_path   = tmpdir / f"frame_{i:05d}.png"
+        for i, (frame_data, dur) in enumerate(ordered):
+            png_path = tmpdir / f"frame_{i:05d}.png"
             ftg.render_frame(frame_data, benchmark, net_edges,
-                             args.net_alpha, str(png_path), args.dpi)
+                             args.net_alpha, str(png_path), args.dpi,
+                             highlight_ids=highlight_ids)
             pil_frames.append(Image.open(png_path).copy())
-            frame_durations.append(duration_ms)
-
-        if has_legal:
-            frame_data = torch.load(legal_frame_path, weights_only=False)
-            png_path   = tmpdir / "frame_legal.png"
-            ftg.render_frame(frame_data, benchmark, net_edges,
-                             args.net_alpha, str(png_path), args.dpi)
-            pil_frames.append(Image.open(png_path).copy())
-            frame_durations.append(5000)
+            frame_durations.append(dur)
 
     gif_path.parent.mkdir(parents=True, exist_ok=True)
     pil_frames[0].save(
