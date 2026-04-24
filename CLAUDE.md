@@ -7,6 +7,20 @@ on a suite of benchmarks and scores it on a proxy cost:
 
   proxy = 1.0×WL + 0.5×density + 0.5×congestion
 
+## Config naming conventions
+
+Config keys in `config.toml` that only apply under a specific parent setting
+should be prefixed with that setting's value. This makes it immediately clear
+at a glance which keys are active.
+
+Examples:
+- `center_init_spread` — only used when `initial_placement = "center"`
+- `sa_T_init`, `sa_T_final`, `sa_steps_per_macro` — only used when
+  `rotation_optimizer = "anneal"`
+
+When adding a new config key that is conditional on another setting, follow
+this pattern: `{parent_value}_{descriptive_name}`.
+
 ## How to run
 ```bash
 # Always use uv run — the macro_place package is only in the project venv
@@ -138,17 +152,43 @@ Mix of hard and soft. ariane133: 133 hard + 782 soft macros.
 
 ## Current results (ibm01)
 ```
-# Electrostatic density + greedy rotation (current best config):
-proxy≈1.04  (0 overlaps)
+# Pre-legalization greedy rotation, all 8 orientations, macro_sizes swap (current best):
+proxy≈0.99  (0 overlaps)
 ```
 
 ## All-benchmark results (best config, 17 IBM benchmarks)
 ```
 rank  avg_proxy   n_bench    params
-1     1.4431      17         rotation_optimizer=greedy  ← current best
-2     1.4548      17         rotation_optimizer=none
+1     1.4431      17         rotation_optimizer=greedy  ← last measured all-bench
 ```
-Status: QUALIFIED (0 overlaps). Greedy rotation optimizer improves avg proxy by ~0.8% over no rotation.
+Status: QUALIFIED (0 overlaps). ibm01 improved from ~1.04 to ~0.99 with rotation refactor.
+
+## Rotation optimizer design
+
+### Correct E/W orientation handling
+- Orientations 0-3 (N/FN/S/FS) are mirror-only: footprint W×H unchanged.
+- Orientations 4-7 (E/FE/W/FW) are 90° rotations: footprint physically becomes H×W.
+- `plc.update_macro_orientation` only rotates **pin offsets** — it never swaps macro
+  dimensions in the plc object.
+- The harness overlap checker (`objective.py`) uses `benchmark.macro_sizes` directly,
+  not plc dimensions. Same for the legalizer.
+- Therefore: rotating to E/W **requires** swapping `benchmark.macro_sizes[m]` (w↔h)
+  so the legalizer and harness both see the correct physical footprint.
+- `_applyOrientationSizes(old_genes, new_genes, benchmark)` is the helper that does
+  this correctly — only swaps when crossing the E/W boundary, safe to call repeatedly.
+
+### Pipeline order
+Rotation **must** run **before** legalization so the legalizer sees the correct
+footprint. Running it after legalization produces physically inconsistent placements
+(legalizer used W×H, harness checks against swapped H×W → detects overlaps).
+
+Current order: mGP → rotation (pre-legalization) → mLG → cGP
+
+### Periodic in-flight rotation (shelved)
+Tried running greedy rotation every 10 iters during mGP with proper macro_sizes swaps.
+Result: proxy hurt (~1.05 vs ~0.99 for pre-legalization greedy). The footprint changes
+disrupt the density gradient too much mid-optimization. Shelved — `rotation_optimizer
+= "greedy"` (pre-legalization single pass) remains the best approach found so far.
 
 ## Key technical concepts
 

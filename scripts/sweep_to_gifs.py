@@ -37,6 +37,7 @@ import argparse
 import importlib.util
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import torch
@@ -100,20 +101,21 @@ def parse_args():
     p.add_argument("--output-name", default="placement.gif",
                    help="GIF filename written inside each run_NNN directory "
                         "(default: placement.gif)")
+    p.add_argument("--workers", type=int, default=8,
+                   help="Number of parallel workers (default: 8)")
     return p.parse_args()
 
 
 def render_run(
     run_dir: Path,
     bench_name: str,
-    benchmark,           # pre-loaded Benchmark object (may be None on first call)
+    benchmark,           # pre-loaded Benchmark object
     args,
-):
-    """Render one run's GIF. Returns (success, benchmark) so the caller can cache it."""
+) -> bool:
     gif_path = run_dir / args.output_name
     if args.skip_existing and gif_path.exists():
         print(f"  skip  {run_dir.relative_to(REPO_ROOT)}  (already exists)")
-        return True, benchmark
+        return True
 
     frames_root = run_dir / "frames" / bench_name
 
@@ -126,14 +128,7 @@ def render_run(
     ordered = ftg.build_ordered_frames(frames_root, step=args.step, fps=args.fps)
     if not ordered:
         print(f"  skip  {run_dir.relative_to(REPO_ROOT)}  (no frames after step={args.step})")
-        return False, benchmark
-
-    if benchmark is None:
-        try:
-            benchmark = ftg.load_benchmark_for_frames(bench_name)
-        except Exception as exc:
-            print(f"  ERROR loading benchmark '{bench_name}': {exc}")
-            return False, None
+        return False
 
     cfg_names, cfg_n_random = ftg._load_visualizer_config()
     highlight_ids = ftg.resolve_highlight_ids(benchmark, cfg_names, cfg_n_random) or None
@@ -166,7 +161,7 @@ def render_run(
         f"  {len(pil_frames)}f  → {gif_path.relative_to(REPO_ROOT)}"
         f"  ({size_kb:.0f} KB)"
     )
-    return True, benchmark
+    return True
 
 
 def main():
@@ -197,19 +192,41 @@ def main():
     print(f"Runs  : {len(runs)}  (step={args.step}, fps={args.fps}, dpi={args.dpi})")
     print()
 
-    # Cache loaded benchmarks so each unique benchmark is only loaded once.
+    # Pre-load each unique benchmark once (serial, cheap relative to rendering).
+    bench_names = sorted({bench_name for _, bench_name in runs})
     benchmark_cache: dict[str, object] = {}
+    for bench_name in bench_names:
+        try:
+            benchmark_cache[bench_name] = ftg.load_benchmark_for_frames(bench_name)
+        except Exception as exc:
+            print(f"  ERROR loading benchmark '{bench_name}': {exc}", file=sys.stderr)
+
+    runs = [(rd, bn) for rd, bn in runs if bn in benchmark_cache]
+
+    n_workers = min(args.workers, len(runs)) if runs else 1
+    print(f"Workers: {n_workers}\n")
     ok = err = 0
 
-    for run_dir, bench_name in runs:
-        cached = benchmark_cache.get(bench_name)
-        success, loaded = render_run(run_dir, bench_name, cached, args)
-        if loaded is not None:
-            benchmark_cache[bench_name] = loaded
-        if success:
-            ok += 1
-        else:
-            err += 1
+    futures = {}
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        for run_dir, bench_name in runs:
+            fut = executor.submit(
+                render_run, run_dir, bench_name,
+                benchmark_cache[bench_name], args,
+            )
+            futures[fut] = (run_dir, bench_name)
+
+        for fut in as_completed(futures):
+            try:
+                success = fut.result()
+            except Exception as exc:
+                run_dir, bench_name = futures[fut]
+                print(f"  ERROR {run_dir.name} {bench_name}: {exc}")
+                success = False
+            if success:
+                ok += 1
+            else:
+                err += 1
 
     print(f"\nDone: {ok} GIF(s) written, {err} skipped/failed.")
 

@@ -9,7 +9,7 @@ Placement phases:
   2. mGP  — mixed global placement: WA HPWL + electrostatic density gradient descent
   2.5     — hard-macro spread: soft macros excluded from density, hard macros spread freely
   3. mLG  — macro legalization: bump or spiral push-out to remove hard-macro overlaps
-  3.5     — post-legalization rotation optimizer (greedy or SA)
+  3.5     — pre-legalization rotation optimizer (greedy or SA; periodic runs during mGP)
   4. cGP  — cell global placement: hard macros fixed, soft macros re-optimized
 
 Module structure:
@@ -348,10 +348,20 @@ class CometPlacer:
         self.soft_place_iters = p.get("soft_place_iters", 1000)
         self.seed = p.get("seed", 42)
         self.deterministic = _asBool(p.get("deterministic", False))
-        self.gamma = None if p.get("gamma", "auto") == "auto" else float(p["gamma"])
+        gamma_cfg = p.get("gamma", "auto")
+        if gamma_cfg == "ovfw":
+            self.gamma = None
+            self.gamma_mode = "ovfw"
+        elif gamma_cfg == "auto":
+            self.gamma = None
+            self.gamma_mode = "decay"
+        else:
+            self.gamma = float(gamma_cfg)
+            self.gamma_mode = "decay"
         self.max_step = None if p.get("max_step", "auto") == "auto" else float(p["max_step"])
         self.gamma_decay = p.get("gamma_decay", 0.98)
         self.gamma_min_frac = p.get("gamma_min_frac", 1 / 150)
+        self.gamma_iters_per_update = p.get("gamma_iters_per_update", 1)
 
     def _readMethodParams(self, p):
         self.density_method = p.get("density_method", "electrostatic")
@@ -376,7 +386,8 @@ class CometPlacer:
             "no-swap":  (0, 1, 2, 3),
             "all":      (0, 1, 2, 3, 4, 5, 6, 7),
         }
-        self.rotation_candidates = _cand_map[p.get("rotation_candidates", "all")]
+        self.rotation_candidates  = _cand_map[p.get("rotation_candidates", "all")]
+        self.n_placement_passes   = p.get("n_placement_passes", 1)
 
     def _readLambdaParams(self, p):
         self.lambda_schedule = p.get("lambda_schedule", "hpwl")
@@ -392,6 +403,7 @@ class CometPlacer:
         # only, starts at lambda_hm_init and decays toward 1.0 each iteration.
         self.lambda_hm_init = p.get("lambda_hm_init", 3.0)
         self.lambda_hm_decay = p.get("lambda_hm_decay", 0.995)
+        self.lambda_iters_per_update = p.get("lambda_iters_per_update", 1)
 
     def _readConvergenceParams(self, p):
         self.stop_overflow = p.get("stop_overflow", 0.1)
@@ -401,7 +413,7 @@ class CometPlacer:
 
     def _readPlacementParams(self, p):
         self.init_placement = p.get("initial_placement", "none")
-        self.init_spread = p.get("initial_spread", 0.01)
+        self.init_spread = p.get("center_init_spread", 0.01)
         self.quad_b2b_iters = p.get("quad_b2b_iters", 3)
         self.quad_net_size_threshold = p.get("quad_net_size_threshold", 50)
 
@@ -425,7 +437,7 @@ class CometPlacer:
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
 
-        pos = self._runPlacementPipeline(benchmark, net_data)
+        pos, _ = self._runPlacementPipeline(benchmark, net_data)
 
         full_pos = benchmark.macro_positions.clone()
         full_pos[:benchmark.num_macros] = pos
@@ -439,6 +451,48 @@ class CometPlacer:
     # direction to the plc's same-named orientations.  The correct plc name for
     # each of our indices is:  N→N  FN→FN  S→S  FS→FS  E→W  FE→FW  W→E  FW→FE
     _OUR_ORI_TO_PLC = ["N", "FN", "S", "FS", "W", "FW", "E", "FE"]
+
+    @staticmethod
+    def _applyOrientationSizes(old_genes, new_genes, benchmark):
+        """
+        Swap macro_sizes w↔h for any macro that crosses the E/W boundary.
+        Orientations 4-7 (E/FE/W/FW) physically transpose the footprint; 0-3 do not.
+        Only swaps when the boundary is crossed (old < 4 and new >= 4, or vice versa),
+        so calling this repeatedly is safe — no double-swaps.
+        Returns the number of macros whose sizes were swapped.
+        """
+        n_swapped = 0
+        for m in range(benchmark.num_hard_macros):
+            was_ew = int(old_genes[m]) >= 4
+            now_ew = int(new_genes[m]) >= 4
+            if was_ew != now_ew:
+                w = benchmark.macro_sizes[m, 0].clone()
+                benchmark.macro_sizes[m, 0] = benchmark.macro_sizes[m, 1]
+                benchmark.macro_sizes[m, 1] = w
+                n_swapped += 1
+        return n_swapped
+
+    @staticmethod
+    def _buildRotatedNetData(genes, net_data_base):
+        """
+        Return a new net_data dict whose offsets reflect the given gene orientations,
+        applied from the all-N baseline in net_data_base.  Used to give Pass 2 the
+        correct starting pin positions without re-running _buildNetData from the plc.
+        """
+        offsets   = net_data_base["offsets"].clone()
+        macro_ids = net_data_base["macro_ids"]
+        for m, gene in enumerate(genes.tolist()):
+            if gene == 0:
+                continue
+            m_mask = macro_ids == m
+            if not m_mask.any():
+                continue
+            mat = _rotation._ORI_MATRICES[gene]
+            dx = offsets[m_mask, 0].clone()
+            dy = offsets[m_mask, 1].clone()
+            offsets[m_mask, 0] = mat[0] * dx + mat[1] * dy
+            offsets[m_mask, 1] = mat[2] * dx + mat[3] * dy
+        return {**net_data_base, "offsets": offsets}
 
     def _runRotationOptimizer(self, pos, net_data, net_data_base, genes, benchmark, gamma, plc=None):
         """
@@ -457,20 +511,19 @@ class CometPlacer:
         candidates = self.rotation_candidates
         # net_data_base is always CPU; rotation ops must run on a consistent device.
         # Work on CPU copies of pos and work_offs, then sync work_offs back.
-        pos_cpu      = pos.detach().cpu()
+        pos_cpu       = pos.detach().cpu()
         work_offs_dev = net_data["offsets"]                  # may be on CUDA
         work_offs_cpu = work_offs_dev.cpu().clone()
+        old_genes     = genes.clone()
 
         mode = self.rotation_optimizer
-        if mode == "greedy":
+        if mode in ("greedy", "periodic"):
             n = _rotation.greedy_rotate(
                 pos_cpu, work_offs_cpu, net_data_base,
                 genes, benchmark, gamma=gamma,
                 n_passes=self.rotation_passes,
                 candidates=candidates,
             )
-            self._out.log(f"  Rotation (greedy, {self.rotation_passes} pass, "
-                          f"cands={candidates}): {n} macro(s) flipped")
         elif mode == "anneal":
             n_steps = self.sa_steps_per_macro * benchmark.num_hard_macros
             n = _rotation.sa_rotate(
@@ -481,20 +534,14 @@ class CometPlacer:
                 T_final=self.sa_T_final,
                 candidates=candidates,
             )
-            self._out.log(
-                f"  Rotation (SA, {n_steps} steps, T {self.sa_T_init:.1e}→{self.sa_T_final:.1e}, "
-                f"cands={candidates}): {n} accepted"
-            )
 
         # Sync rotated offsets back to the original device tensor.
         work_offs_dev.copy_(work_offs_cpu.to(work_offs_dev.device))
 
-        # Swap macro_sizes w↔h for E/W-oriented macros (orientations 4-7 transpose).
-        for m in range(benchmark.num_hard_macros):
-            if int(genes[m]) >= 4:
-                w = benchmark.macro_sizes[m, 0].clone()
-                benchmark.macro_sizes[m, 0] = benchmark.macro_sizes[m, 1]
-                benchmark.macro_sizes[m, 1] = w
+        # Swap macro_sizes w↔h for macros that crossed the E/W boundary.
+        n_swapped = self._applyOrientationSizes(old_genes, genes, benchmark)
+        self._out.log(f"  Rotation (pre-legalization): {n} macro(s) rotated, "
+                      f"{n_swapped} size-swapped")
 
         # Sync all non-N orientations to plc so harness sees rotated pin positions.
         # Assumes plc is in N orientation when this is called (true because _loadPlc()
@@ -610,7 +657,32 @@ class CometPlacer:
         if ga_active:
             net_data, benchmark, current_genes = self._runGa(benchmark, net_data_base)
 
-        pos = self._runPlacementPipeline(benchmark, net_data, net_data_base, current_genes, plc)
+        genes = current_genes
+        nd    = net_data
+        for pass_idx in range(self.n_placement_passes):
+            if pass_idx > 0:
+                print(f"\n  ── Placement pass {pass_idx + 1} / {self.n_placement_passes} "
+                      f"(locked orientations from pass {pass_idx}) ──")
+                # Rebuild net_data with pass (pass_idx-1)'s orientations applied to N-baseline.
+                nd = self._buildRotatedNetData(genes, net_data_base)
+                # Reload plc: update_macro_orientation is cumulative and "N" is a no-op,
+                # so there is no way to reset pin offsets without reloading from disk.
+                plc = _loadPlc(benchmark.name)
+            pos, genes = self._runPlacementPipeline(
+                benchmark, nd, net_data_base, genes, plc,
+                run_rotation=(pass_idx == 0),
+            )
+
+        # Sync final orientations to plc. On pass 1 this was done inside
+        # _runRotationOptimizer; on locked passes rotation is skipped so the
+        # freshly-reloaded plc (N orientation) needs an explicit sync here.
+        if plc is not None:
+            for m in range(benchmark.num_hard_macros):
+                gene = int(genes[m])
+                if gene != 0:
+                    plc.update_macro_orientation(
+                        plc.hard_macro_indices[m], self._OUR_ORI_TO_PLC[gene]
+                    )
 
         full_pos = benchmark.macro_positions.clone()
         full_pos[:benchmark.num_macros] = pos
@@ -625,8 +697,8 @@ class CometPlacer:
     # Gradient descent loop
     # -------------------------------------------------------------------
 
-    def _runPlacementPipeline(self, benchmark, net_data, net_data_base=None, current_genes=None, plc=None):
-        """Orchestrates all placement phases: mGP → hard spread → mLG → rotation → cGP."""
+    def _runPlacementPipeline(self, benchmark, net_data, net_data_base=None, current_genes=None, plc=None, run_rotation=True):
+        """Orchestrates all placement phases: mGP → hard spread → mLG → [rotation] → cGP."""
         net_data = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
                     for k, v in net_data.items()}
 
@@ -636,7 +708,7 @@ class CometPlacer:
                      else torch.zeros(benchmark.num_hard_macros, dtype=torch.int8))
 
         # Phase 2: mGP
-        last_t = self._mixedGlobalPlacement(state, benchmark, net_data, rot_genes, net_data_base)
+        last_t = self._mixedGlobalPlacement(state, benchmark, net_data, rot_genes, net_data_base, run_rotation)
 
         # Phase 2.5: hard-macro spread
         self._out.log(f"  hard_spread={self.hard_spread}  "
@@ -647,8 +719,8 @@ class CometPlacer:
         self._out.close()
 
 
-        # Phase 3.5: pre-legalization rotation optimizer
-        if self.rotation_optimizer in ("greedy", "anneal") and net_data_base is not None:
+        # Phase 3.5: pre-legalization rotation optimizer (skipped on locked passes)
+        if run_rotation and self.rotation_optimizer in ("greedy", "anneal") and net_data_base is not None:
             self._runRotationOptimizer(
                 state["pos"], net_data, net_data_base, rot_genes, benchmark,
                 state["gamma"], plc
@@ -671,25 +743,32 @@ class CometPlacer:
                 state["overflow_history"][-1] if state["overflow_history"] else 1.0
             ),
         }
-        return state["pos"].cpu()
+        return state["pos"].cpu(), rot_genes
 
-    def _mixedGlobalPlacement(self, state, benchmark, net_data, rot_genes, net_data_base=None):
+    def _mixedGlobalPlacement(self, state, benchmark, net_data, rot_genes, net_data_base=None, run_rotation=True):
         """Phase 2 (mGP): WA HPWL + electrostatic density gradient descent main loop."""
         for t in range(self.max_iters):
             should_stop = self._runOneIteration(t, state, benchmark, net_data)
             if should_stop:
                 break
 
-            if (self.rotation_optimizer == "periodic"
+            if (run_rotation
+                    and self.rotation_optimizer == "periodic"
                     and net_data_base is not None
                     and t > self.warmup_iters
                     and t % self.rotation_period == 0):
+                pos_cpu       = state["pos"].detach().cpu()
+                work_offs_dev = net_data["offsets"]
+                work_offs_cpu = work_offs_dev.cpu().clone()
+                old_genes     = rot_genes.clone()
                 n = _rotation.greedy_rotate(
-                    state["pos"], net_data["offsets"], net_data_base,
+                    pos_cpu, work_offs_cpu, net_data_base,
                     rot_genes, benchmark, gamma=state["gamma"],
+                    candidates=self.rotation_candidates,
                 )
-                if n:
-                    self._out.log(f"    [rotation t={t}] {n} macro(s) flipped")
+                work_offs_dev.copy_(work_offs_cpu.to(work_offs_dev.device))
+                n_swapped = self._applyOrientationSizes(old_genes, rot_genes, benchmark)
+                print(f"    [rotation t={t}] {n} macro(s) rotated, {n_swapped} size-swapped")
         return t
 
     def _macroLegalization(self, state, last_t, benchmark):
@@ -758,8 +837,8 @@ class CometPlacer:
                     break
 
             self._trackBestWl(wl_val, state)
-            state["gamma"] = max(state["gamma"] * self.gamma_decay,
-                                 state["gamma_min"])
+            if s % self.gamma_iters_per_update == 0:
+                self._stepGamma(state, overflow)
 
             if self._out.shouldLog(s, self.hard_spread_iters):
                 self._out.log(
@@ -810,6 +889,7 @@ class CometPlacer:
             "canvas_w": canvas_w,
             "canvas_h": canvas_h,
             "gamma": gamma,
+            "gamma_base": gamma / 10.0,
             "max_step": max_step,
             "gamma_min": gamma_min,
             "fixed_mask": fixed_mask,
@@ -867,9 +947,11 @@ class CometPlacer:
                 alpha = self._stepSgd(grad, state)
 
             self._trackBestWl(wl_val, state)
-            self._updateLambda(t, wl_val, wl_grad, den_grad, den_energy, state,
-                               overflow=overflow)
-            state["gamma"] = max(state["gamma"] * self.gamma_decay, gamma_min)
+            if t % self.lambda_iters_per_update == 0:
+                self._updateLambda(t, wl_val, wl_grad, den_grad, den_energy, state,
+                                   overflow=overflow)
+            if t % self.gamma_iters_per_update == 0:
+                self._stepGamma(state, overflow)
 
             if self._out.shouldLog(t, self.soft_place_iters):
                 self._out.log(
@@ -923,6 +1005,7 @@ class CometPlacer:
             "canvas_w": canvas_w,
             "canvas_h": canvas_h,
             "gamma": gamma,
+            "gamma_base": gamma / 10.0,
             "max_step": max_step,
             "gamma_min": gamma_min,
             "fixed_mask": fixed_mask,
@@ -1017,6 +1100,13 @@ class CometPlacer:
     # Single iteration
     # -------------------------------------------------------------------
 
+    def _stepGamma(self, state, overflow):
+        if self.gamma_mode == "ovfw":
+            coef = 10.0 ** ((overflow - 0.1) * 20.0 / 9.0 - 1.0)
+            state["gamma"] = max(coef * state["gamma_base"], state["gamma_min"])
+        else:
+            state["gamma"] = max(state["gamma"] * self.gamma_decay, state["gamma_min"])
+
     def _runOneIteration(self, t, state, benchmark, net_data):
         """Execute one gradient descent iteration. Returns True if should stop."""
         eval_pos = state["v_k"] if self.optimizer == "nesterov" else state["pos"]
@@ -1041,9 +1131,11 @@ class CometPlacer:
                 return True
 
         self._trackBestWl(wl_val, state)
-        self._updateLambda(t, wl_val, wl_grad, den_grad, den_energy, state,
-                           overflow=overflow)
-        state["gamma"] = max(state["gamma"] * self.gamma_decay, state["gamma_min"])
+        if t % self.lambda_iters_per_update == 0:
+            self._updateLambda(t, wl_val, wl_grad, den_grad, den_energy, state,
+                               overflow=overflow)
+        if t % self.gamma_iters_per_update == 0:
+            self._stepGamma(state, overflow)
         # Decay hard-macro density boost toward 1.0
         if state["lambda_hm"] > 1.0:
             state["lambda_hm"] = max(1.0, state["lambda_hm"] * self.lambda_hm_decay)

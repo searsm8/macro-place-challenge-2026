@@ -19,8 +19,8 @@ sweep/
 Usage
 -----
     # cd to repo root first, then:
-    uv run python sweep/sweep.py                         # ibm01, 8 workers
-    uv run python sweep/sweep.py --all --workers 16      # all benchmarks
+    uv run python sweep/sweep.py                         # ibm01, 8 parallel workers
+    uv run python sweep/sweep.py --all --workers 16      # all benchmarks, 16 workers
     uv run python sweep/sweep.py -b ibm03 --quiet        # specific benchmark
     uv run python sweep/sweep.py --keep-best             # write best to config.toml
 """
@@ -32,7 +32,6 @@ Usage
 SWEEP = {
     #"target_density": [0.50, 0.80],
     #"initial_spread": [0.01, 0.04, 0.15],
-    #"lambda_hm_init": [1, 2, 3, 20],
     #"warmup_iters": [0, 1, 10, 20, 40],
     #"optimizer": ["sgd", "bb_sgd", "nesterov"],
     #"halo_size": [ 0.3, 0.4, 0.5, 0.6],
@@ -40,19 +39,30 @@ SWEEP = {
     #"halo_legalize": [0.1, 0.15],
 
     #"lambda_pcof_upper": [1.03, 1.05],
+    #"lambda_hm_init": [1, 2, 3, 5, 10, 20], #(4/23) 1 is best (disabled density boost)
     #"soft_place": ["False", "True"],
     #"initial_placement": ["none", "center", "quadratic"],
     #"initial_placement": ["none", "quadratic"],
-    #"density_weight": [8e-2, 1.6e-1, 3.2e-1, 6.4e-1],
+    #"initial_placement": ["center"],
+    #"center_init_spread": [0.15],
+    #"density_weight": [1e-3],
+    #"lambda_iters_per_update": [1, 3, 5],
     #"hard_spread": ["False", "True"],
     #"hard_spread_iters": [0, 50],
     #"ga_enable": ["False", "True"],
     #"curtailed_iters": [300, 500, 700, 900]
 
     #"stop_overflow": [0.03, 0.04, .05],
-    "rotation_optimizer": ["none", "greedy"],
+    #"rotation_optimizer": ["none", "greedy"],
     #"use_gpu": ["False", "True"],
-    "deterministic": ["False","False","True","True"],
+    #"deterministic": ["False","False","True","True"],
+    #"n_placement_passes": [1, 2],
+    #"rotation_candidates": ["all", "no-swap"],
+    #"gamma_decay": [0.991, 0.992, 0.993, 0.994],
+    #"gamma": ["auto", "ovfw"],
+
+    "quad_b2b_iters": [0, 1, 3, 6],     
+    "quad_net_size_threshold": [20, 80, 150],
 }
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -63,8 +73,10 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -77,8 +89,9 @@ MASTER_CSV  = SWEEP_DIR / "results.csv"
 UV          = "/home/msears/.local/bin/uv"
 
 IBM_BENCHMARKS = [
-    "ibm01", "ibm02", "ibm03", "ibm04", "ibm06", "ibm07", "ibm08", "ibm09",
+    #"ibm01", "ibm02", "ibm03", "ibm04", "ibm06", "ibm07", "ibm08", "ibm09",
     #"ibm10", "ibm11", "ibm12", "ibm13", "ibm14", "ibm15", "ibm16", "ibm17", "ibm18",
+    "ibm01", "ibm04", "ibm14", # small+medium+large subset for quick testing
 ]
 
 METRIC_COLS = ["proxy", "wl", "den", "cong", "valid", "time_s", "iters", "overlaps"]
@@ -346,6 +359,8 @@ def parse_args():
                    help="Skip frame snapshots (faster; disables --render-gifs)")
     p.add_argument("--render-gifs", action="store_true",
                    help="Render a placement.gif for each run after it completes")
+    p.add_argument("--workers", type=int, default=8,
+                   help="Number of parallel workers (default: 8)")
     p.add_argument("--keep-best", action="store_true",
                    help="Write the best config to submissions/msears/config.toml")
     return p.parse_args()
@@ -380,48 +395,61 @@ def main():
     print(f"Master : {MASTER_CSV.relative_to(REPO_ROOT)}")
     print()
 
-    # Build job list: one entry per (combo_id, benchmark) pair
-    jobs = []
-    for combo_id, combo in enumerate(combos, 1):
-        params = dict(zip(sweep_keys, combo))
-        for benchmark in benchmarks:
+    # Build job list: benchmark-outer so all combos for one benchmark run before
+    # moving to the next.
+    jobs: dict[str, list] = {b: [] for b in benchmarks}
+    for benchmark in benchmarks:
+        for combo_id, combo in enumerate(combos, 1):
+            params  = dict(zip(sweep_keys, combo))
             run_dir = sweep_run_dir / benchmark / f"run_{combo_id:03d}"
-            jobs.append((run_dir, benchmark, combo_id, params))
+            jobs[benchmark].append((run_dir, benchmark, combo_id, params))
 
-    # ── Execute serially ──────────────────────────────────────────────────────
+    # ── Execute in parallel, one benchmark at a time ──────────────────────────
     collected: list[tuple[int, dict, dict]] = []   # (combo_id, params, result)
 
     record_frames = args.record_frames
     render_gifs   = args.render_gifs
+    n_workers     = min(args.workers, n_combos) if n_combos > 0 else 1
 
-    for run_dir, benchmark, combo_id, params in jobs:
-        try:
-            result = run_one(
-                run_dir, benchmark, combo_id, params,
-                original_config, args.quiet,
-                record_frames, render_gifs,
-            )
-        except Exception as exc:
-            print(f"  [ERROR] combo={combo_id:03d} {benchmark}: {exc}")
-            result = None
-        if result:
-            collected.append((combo_id, params, result))
+    # Initialise both CSVs with headers before the loop so partial results are
+    # written immediately after each run (safe to interrupt mid-sweep).
+    sweep_csv      = sweep_run_dir / "results.csv"
+    sweep_csv_cols = _sweep_csv_columns(sweep_keys)
+    write_csv(sweep_csv,  [], sweep_csv_cols,      append=False)
+    write_csv(MASTER_CSV, [], MASTER_CSV_COLUMNS,  append=True)
 
-    # ── Write CSVs ────────────────────────────────────────────────────────────
-    csv_rows = [
-        _build_csv_row(ts, combo_id, params, result)
-        for combo_id, params, result in collected
-    ]
+    csv_lock = threading.Lock()
+    print(f"Workers: {n_workers}")
 
-    if csv_rows:
-        # Per-sweep CSV (fresh) — includes sweep param columns
-        sweep_csv = sweep_run_dir / "results.csv"
-        write_csv(sweep_csv, csv_rows, _sweep_csv_columns(sweep_keys), append=False)
-        print(f"\nSweep CSV : {sweep_csv.relative_to(REPO_ROOT)}")
+    futures = {}
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        for benchmark in benchmarks:
+            for run_dir, bm, combo_id, params in jobs[benchmark]:
+                fut = executor.submit(
+                    run_one,
+                    run_dir, bm, combo_id, params,
+                    original_config, args.quiet,
+                    record_frames, render_gifs,
+                )
+                futures[fut] = (combo_id, params)
 
-        # Master CSV (append) — sweep params collapsed to sweep_id only
-        write_csv(MASTER_CSV, csv_rows, MASTER_CSV_COLUMNS, append=True)
-        print(f"Master CSV: {MASTER_CSV.relative_to(REPO_ROOT)}")
+        for fut in as_completed(futures):
+            combo_id, params = futures[fut]
+            try:
+                result = fut.result()
+            except Exception as exc:
+                print(f"  [ERROR] combo={combo_id:03d}: {exc}")
+                result = None
+            if result:
+                collected.append((combo_id, params, result))
+                row = _build_csv_row(ts, combo_id, params, result)
+                with csv_lock:
+                    write_csv(sweep_csv,  [row], sweep_csv_cols,     append=True)
+                    write_csv(MASTER_CSV, [row], MASTER_CSV_COLUMNS, append=True)
+
+    # ── CSV paths already written incrementally; just print locations ─────────
+    print(f"\nSweep CSV : {sweep_csv.relative_to(REPO_ROOT)}")
+    print(f"Master CSV: {MASTER_CSV.relative_to(REPO_ROOT)}")
 
     # ── Ranked summary ────────────────────────────────────────────────────────
     if not collected:

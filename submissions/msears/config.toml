@@ -4,33 +4,24 @@
 
 [params]
 # ── Phase 1: mIP — Macro Initial Placement ────────────────────────────────
-# "none"      : use benchmark default positions
-# "center"    : scatter randomly near canvas center (see initial_spread)
-# "quadratic" : quadratic WL solve (B2B CLIQUE + refinement)
-initial_placement        = "quadratic"
-initial_spread           = 0.01   # fraction of canvas area for center-scatter radius
-quad_b2b_iters           = 3      # B2B refinement passes after CLIQUE warm-start (0 = CLIQUE only)
-quad_net_size_threshold  = 50     # nets larger than this use star model instead of CLIQUE
+initial_placement        = "quadratic"   # "none", "center", or "quadratic"
+center_init_spread       = 0.01    # fraction of canvas area for center-scatter radius (only used when initial_placement = "center")
+quad_b2b_iters           = 6       # B2B refinement passes after CLIQUE warm-start (0 = CLIQUE only)
+quad_net_size_threshold  = 50      # nets larger than this use star model instead of CLIQUE
 
 # ── Phase 2: mGP — Mixed Global Placement ─────────────────────────────────
-use_gpu               = true           # use CUDA GPU if available; false forces CPU
+use_gpu               = true            # use CUDA GPU if available; false forces CPU
 density_method        = "electrostatic" # "bell" or "electrostatic"
-use_preconditioner    = true           # divide gradient by (macro_area + net_degree)
-optimizer             = "bb_sgd"       # "sgd", "bb_sgd", or "nesterov"
-alpha_init            = "auto"         # initial step size for bb_sgd/nesterov
-max_iters             = 8000           # upper bound; early stopping usually fires first
+use_preconditioner    = true            # divide gradient by (macro_area + net_degree)
+optimizer             = "bb_sgd"        # "sgd", "bb_sgd", or "nesterov"
+alpha_init            = "auto"          # initial step size for bb_sgd/nesterov
+max_iters             = 8000            # upper bound; early stopping usually fires first
 seed                  = 42
-deterministic         = true           # force deterministic GPU ops; ~10-30% slower
-
-# Smoothness of the WA HPWL approximation.
-# "auto" -> canvas_diag / 8.0 at runtime. Set a float to override.
-gamma         = "auto"
-gamma_decay   = 0.98     # multiply gamma by this each iteration
+deterministic         = true            # force deterministic GPU ops; ~10-30% slower
+gamma          = "auto"  # WA HPWL smoothness: "auto" (decay from canvas_diag/8), "ovfw" (overflow-driven, XPlace), or <float>
+gamma_decay    = 0.994   # multiply gamma by this each iteration
 gamma_min_frac = 0.00667 # gamma_min = canvas_diag * gamma_min_frac
-
-# Maximum distance any macro can move in one iteration.
-# "auto" -> canvas_diag * 0.005. Set a float to override.
-max_step      = "auto"
+max_step       = "auto"  # max macro displacement per iter: "auto" (canvas_diag × 0.005) or <float>
 
 # ── mGP convergence ───────────────────────────────────────────────────────
 stop_overflow      = 0.05   # Lgamma: stop when overflow_ratio < this AND wl rising
@@ -51,59 +42,41 @@ density_weight_init     = 1e-5
 density_weight_max_step = 1.05
 
 # shared
-warmup_iters            = 20
-density_weight_max      = 5000
+warmup_iters            = 0
+lambda_iters_per_update = 1      # update lambda every N iters (1 = every iter)
+gamma_iters_per_update  = 1      # update gamma every N iters (1 = every iter)
+density_weight_max      = 9000
 target_density          = 0.5
 
 # ── mGP hard-macro density boost ──────────────────────────────────────────
-# Extra multiplier on the density gradient for hard macros only.
-# Starts at lambda_hm_init, decays by lambda_hm_decay each iter toward 1.0.
-lambda_hm_init  = 1.0    # initial hard-macro density boost (1.0 = disabled)
-lambda_hm_decay = 0.995  # per-iter decay
+lambda_hm_init  = 1.0    # initial hard-macro density boost (1.0 = disabled); decays toward 1.0 each iter
+lambda_hm_decay = 0.995  # per-iter decay toward 1.0
 
 # ── mGP macro halos ───────────────────────────────────────────────────────
-# Inflate hard macro footprints in the density map by this fraction, reserving
-# whitespace so the legalizer makes smaller corrections.
-# halo_size = 0.1 → macro occupies (1.1w)×(1.1h) in the density field.
-# Charge is conserved via area_ratio scaling (see density.py). 0 = disabled.
-halo_size     = 0.4
+halo_size     = 0.4   # inflate hard macro footprints in density map by this fraction (0 = disabled); e.g. 0.1 → (1.1w)×(1.1h), charge conserved via area_ratio
 halo_legalize = 0.1
 
 # ── Phase 2.5: Hard-macro spread ──────────────────────────────────────────
-# After mGP convergence, remove soft macros from the density map and run a
-# short continuation so hard macros spread into remaining whitespace.
+# After mGP convergence, remove soft macros and re-run so hard macros spread into whitespace.
 # Only supported with density_method = "electrostatic".
 hard_spread       = false  # enable phase 2.5
 hard_spread_iters = 50     # number of SGD iterations
 
 # ── Phase 3: mLG — Macro Legalization ─────────────────────────────────────
-# "none"   : skip legalization (allow overlaps)
-# "bump"   : pairwise bump (iterative push-apart)
-# "spiral" : spiral push-out from canvas center
-legalization = "bump"
+legalization = "bump"  # "none", "bump" (pairwise push-apart), or "spiral" (push-out from center)
 
 # ── Phase 3.5: Rotation Optimizer ─────────────────────────────────────────
-# "none"     : skip
-# "greedy"   : exhaustive greedy flip after mLG
-# "anneal"   : simulated annealing after mLG
-# "periodic" : greedy flip every rotation_period mGP iterations
-rotation_optimizer   = "greedy"  # "none", "greedy", "anneal", or "periodic"
-rotation_passes      = 2         # greedy: full passes over all macros
-rotation_period      = 20        # periodic: mGP iters between rotation calls
-sa_T_init            = 1e-4      # SA initial temperature (WL units)
-sa_T_final           = 1e-7      # SA final temperature
-sa_steps_per_macro   = 200       # SA total steps = this × num_hard_macros
-# Orientation candidates for the rotation optimizer:
-#   "NS"      : N, S only (180° rotation — most conservative)
-#   "no-swap" : N, FN, S, FS (all non-transposing; mirrors only)
-#   "all"     : all 8 D4 orientations including E/W 90° rotations (default)
-# E/W are safe: plc.update_macro_orientation only rotates pin offsets, not
-# macro footprints, so legalization remains valid.
-rotation_candidates  = "all"
+rotation_optimizer   = "greedy"   # "none", "greedy", "anneal", or "periodic"
+rotation_passes      = 1          # greedy/periodic: full passes over all macros per call
+rotation_period      = 10         # periodic: mGP iters between rotation calls
+sa_T_init            = 1e-4       # SA initial temperature (WL units)
+sa_T_final           = 1e-7       # SA final temperature
+sa_steps_per_macro   = 200        # SA total steps = this × num_hard_macros
+rotation_candidates  = "no-swap"  # "NS", "no-swap" (mirrors only), or "all" (all 8 D4 orientations)
+n_placement_passes   = 2          # run full pipeline this many times, locking orientations between passes
 
 # ── Phase 4: cGP — Cell Global Placement ──────────────────────────────────
-# Lock hard macros at legalized positions; re-run WL + density gradient
-# descent for soft macros only to fill whitespace left by mLG.
+# Lock hard macros; re-run WL + density descent for soft macros only.
 soft_place       = true   # enable phase 4
 soft_place_iters = 1000   # max iterations (early stopping applies)
 
@@ -112,16 +85,11 @@ log_every     = 50
 record_frames = true
 frames_dir    = "vis/frames"
 quiet         = false
-# Specific macros to highlight by name in the GIF renderer.
-# Takes priority over highlight_random_macros. Example:
-#   highlight_macros = ["a12324", "a3044"]
-highlight_macros = []
-# Randomly highlight N macros weighted by area. Used only when highlight_macros is empty.
-highlight_random_macros = 2
+highlight_macros        = []  # specific macro names to highlight in GIF; takes priority over highlight_random_macros
+highlight_random_macros = 2   # randomly highlight N macros by area (used only when highlight_macros is empty)
 
 # ── Genetic Algorithm (orientation search) ────────────────────────────────
-# Set enabled = true to activate. The GA runs before the full gradient descent,
-# finding the best hard-macro orientation assignment via curtailed placements.
+# Set ga_enable = true to run a GA before gradient descent to find the best hard-macro orientation assignment.
 [ga]
 ga_enable                  = false
 ga_population_size         = 16
