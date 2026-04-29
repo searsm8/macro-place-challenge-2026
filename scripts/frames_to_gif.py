@@ -9,7 +9,7 @@ on each frame — no PlacementCost (plc) object is needed, so rendering stays fa
 Each frame is rendered as a single-panel matplotlib figure showing:
   • Hard macros (steelblue), soft macros (lightsteelblue), fixed macros (red)
   • I/O port pins (green)
-  • Net connections (gray, alpha=0.05) — star topology: driver → each sink
+  • Net connections (gray, alpha=0.1) — star topology: driver → each sink
 
 Usage:
     # Default: reads vis/frames/ibm01/, writes vis/ibm01_opt.gif
@@ -41,20 +41,21 @@ from PIL import Image
 def _load_visualizer_config():
     """
     Read highlight settings from submissions/msears/config.toml.
-    Returns (highlight_macros: list[str], highlight_random_macros: int).
-    Falls back to ([], 0) if the key / file is absent.
+    Returns (highlight_macros: list[str], highlight_random_macros: int, highlight_scatter_macros: int).
+    Falls back to ([], 0, 0) if the key / file is absent.
     """
     import tomllib
     repo_root = Path(__file__).resolve().parent.parent
     cfg_path = repo_root / "submissions" / "msears" / "config.toml"
     if not cfg_path.exists():
-        return [], 0
+        return [], 0, 0
     with open(cfg_path, "rb") as f:
         cfg = tomllib.load(f)
     out = cfg.get("output", {})
-    names   = list(out.get("highlight_macros", []))
-    n_rand  = int(out.get("highlight_random_macros", 0))
-    return names, n_rand
+    names     = list(out.get("highlight_macros", []))
+    n_rand    = int(out.get("highlight_random_macros", 0))
+    n_scatter = int(out.get("highlight_scatter_macros", 0))
+    return names, n_rand, n_scatter
 
 
 def _sample_highlight_ids(benchmark, n):
@@ -133,8 +134,8 @@ def parse_args():
                    help="Render DPI — lower = smaller/faster (default: 80)")
     p.add_argument("--no-nets", dest="draw_nets", action="store_false", default=True,
                    help="Disable net connection lines even if net_edges.pt is present")
-    p.add_argument("--net-alpha", type=float, default=0.05,
-                   help="Opacity of net lines (default: 0.05). "
+    p.add_argument("--net-alpha", type=float, default=0.1,
+                   help="Opacity of net lines (default: 0.1). "
                         "Raise to 0.1–0.2 for sparser benchmarks.")
     p.add_argument("--highlight", nargs="+", default=[], metavar="MACRO_NAME",
                    help="Macro names whose nets are drawn at alpha=0.95 "
@@ -460,8 +461,8 @@ def main():
     print("done")
 
     # Resolve highlight macro names → indices.
-    # Priority: --highlight CLI > highlight_macros config > random sampling.
-    cfg_names, cfg_n_random = _load_visualizer_config()
+    # Priority: --highlight CLI > highlight_macros config > scatter > random sampling.
+    cfg_names, cfg_n_random, cfg_n_scatter = _load_visualizer_config()
     name_to_idx = {name: i for i, name in enumerate(benchmark.macro_names)}
 
     highlight_ids = set()
@@ -476,6 +477,16 @@ def main():
             found = [benchmark.macro_names[i] for i in sorted(highlight_ids)]
             src = "CLI" if args.highlight else "config"
             print(f"  Highlight : {found}  (ids: {sorted(highlight_ids)})  [{src}]")
+
+    if not highlight_ids and cfg_n_scatter > 0:
+        scatter_pt = frames_root / "scatter_ids.pt"
+        if scatter_pt.exists():
+            import torch as _torch
+            data = _torch.load(scatter_pt, weights_only=True)
+            ids = data["scatter_ids"].tolist()[:cfg_n_scatter]
+            highlight_ids = set(ids)
+            found = [benchmark.macro_names[i] for i in ids]
+            print(f"  Highlight : {found}  (ids: {ids})  [scatter, n={cfg_n_scatter}]")
 
     if not highlight_ids:
         n_random = args.highlight_random if args.highlight_random is not None \

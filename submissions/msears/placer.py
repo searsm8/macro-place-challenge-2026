@@ -213,8 +213,25 @@ def _flattenNets(plc, pin_to_macro, port_pos):
 
 
 # ---------------------------------------------------------------------------
-# Vectorized WA HPWL
+# Vectorized WA HPWL + exact HPWL
 # ---------------------------------------------------------------------------
+
+def _exactHpwl(pos, net_data):
+    """Exact (non-smoothed) total HPWL: sum of per-net bounding-box spans."""
+    macro_ids = net_data["macro_ids"]
+    offsets   = net_data["offsets"]
+    net_ids   = net_data["net_ids"]
+    is_macro  = net_data["is_macro"]
+    num_nets  = net_data["num_nets"]
+    with torch.no_grad():
+        pin_pos = _computePinPositions(pos, macro_ids, offsets, is_macro)
+        max_xy = pin_pos.new_full((num_nets, 2), float("-inf"))
+        min_xy = pin_pos.new_full((num_nets, 2), float("inf"))
+        idx2 = net_ids.unsqueeze(1).expand(-1, 2)
+        max_xy.scatter_reduce_(0, idx2, pin_pos, reduce="amax", include_self=True)
+        min_xy.scatter_reduce_(0, idx2, pin_pos, reduce="amin", include_self=True)
+        return float((max_xy - min_xy).sum())
+
 
 def _waHpwl(pos, net_data, gamma):
     """
@@ -344,6 +361,7 @@ class CometPlacer:
         self.device = torch.device("cuda" if (use_gpu and torch.cuda.is_available()) else "cpu")
 
     def _readAlgorithmParams(self, p):
+        self.mgp_enable = _asBool(p.get("mgp_enable", True))
         self.max_iters = p.get("max_iters", 2000)
         self.soft_place_iters = p.get("soft_place_iters", 1000)
         self.seed = p.get("seed", 42)
@@ -371,6 +389,9 @@ class CometPlacer:
         self.hard_spread_iters = p.get("hard_spread_iters", 50)
         self.halo_size = float(p.get("halo_size", 0.0))
         self.halo_legalize = float(p.get("halo_legalize", self.halo_size))
+        gs = p.get("density_grid_size", None)
+        self.density_grid_rows = int(gs) if gs is not None else None
+        self.density_grid_cols = int(gs) if gs is not None else None
         self.use_precond = _asBool(p.get("use_preconditioner", True))
         self.optimizer = p.get("optimizer", "sgd")
         self.alpha_init = None if p.get("alpha_init", "auto") == "auto" else float(p["alpha_init"])
@@ -391,13 +412,13 @@ class CometPlacer:
 
     def _readLambdaParams(self, p):
         self.lambda_schedule = p.get("lambda_schedule", "hpwl")
-        self.density_weight = p.get("density_weight", 8e-4)
+        self.density_weight = p.get("lambda", 8e-4)
         self.lambda_pcof_upper = p.get("lambda_pcof_upper", 1.05)
         self.lambda_pcof_lower = p.get("lambda_pcof_lower", 0.95)
         self.density_weight_init = p.get("density_weight_init", 1e-5)
         self.density_weight_max_step = p.get("density_weight_max_step", 1.04)
         self.warmup_iters = p.get("warmup_iters", 20)
-        self.density_weight_max = p.get("density_weight_max", 5000.0)
+        self.density_weight_max = p.get("lambda_max", 5000.0)
         self.target_density = p.get("target_density", 0.5)
         # Hard-macro density boost: multiplies density gradient for hard macros
         # only, starts at lambda_hm_init and decays toward 1.0 each iteration.
@@ -410,12 +431,20 @@ class CometPlacer:
         self.plateau_window = p.get("plateau_window", 10)
         self.plateau_thresh = p.get("plateau_threshold", 0.001)
         self.divergence_window = p.get("divergence_window", 50)
+        self.conv_lgamma     = _asBool(p.get("conv_lgamma",      True))
+        self.conv_max_den    = _asBool(p.get("conv_max_density",  True))
+        self.conv_plateau    = _asBool(p.get("conv_plateau",      True))
+        self.conv_lambda_max = _asBool(p.get("conv_lambda_max",   True))
+        self.conv_divergence = _asBool(p.get("conv_divergence",   True))
+        self.convergence_countdown = p.get("convergence_countdown", 30)
 
     def _readPlacementParams(self, p):
         self.init_placement = p.get("initial_placement", "none")
         self.init_spread = p.get("center_init_spread", 0.01)
         self.quad_b2b_iters = p.get("quad_b2b_iters", 3)
         self.quad_net_size_threshold = p.get("quad_net_size_threshold", 50)
+        self.quad_anchor_fraction   = p.get("quad_anchor_fraction", 0.0)
+        self.quad_scatter_fraction  = p.get("quad_scatter_fraction", 0.0)
 
     def placeWithData(self, benchmark, net_data: dict):
         """
@@ -708,16 +737,17 @@ class CometPlacer:
                      else torch.zeros(benchmark.num_hard_macros, dtype=torch.int8))
 
         # Phase 2: mGP
-        last_t = self._mixedGlobalPlacement(state, benchmark, net_data, rot_genes, net_data_base, run_rotation)
+        if self.mgp_enable:
+            last_t = self._mixedGlobalPlacement(state, benchmark, net_data, rot_genes, net_data_base, run_rotation)
+        else:
+            self._out.log("  [mgp_enable=false] skipping mGP")
+            last_t = 0
 
         # Phase 2.5: hard-macro spread
         self._out.log(f"  hard_spread={self.hard_spread}  "
                       f"hard_spread_iters={self.hard_spread_iters}")
         if self.hard_spread and benchmark.num_soft_macros > 0:
             last_t = self._hardMacroSpread(state, benchmark, net_data, frame_offset=last_t + 1)
-
-        self._out.close()
-
 
         # Phase 3.5: pre-legalization rotation optimizer (skipped on locked passes)
         if run_rotation and self.rotation_optimizer in ("greedy", "anneal") and net_data_base is not None:
@@ -726,16 +756,38 @@ class CometPlacer:
                 state["gamma"], plc
             )
 
-        # Phase 3: mLG
+        # --- snapshot after phase 2 ---
+        nh = benchmark.num_hard_macros
+        sizes_cpu = benchmark.macro_sizes.cpu()
+        net_data_cpu = {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in net_data.items()}
+        pos_p2 = state["pos"].detach().cpu()
+        ovfw_p2 = state["overflow_history"][-1] if state["overflow_history"] else None
+        snapshots = [{"phase": "2: mGP", "hpwl": _exactHpwl(pos_p2, net_data_cpu), "overflow": ovfw_p2, "hard_overlaps": _legalizer._countOverlaps(pos_p2, nh, sizes_cpu), "soft_disp": None}]
+
+        # Phase 3: mLG — reset best_pos to legalized result so cGP tracks from clean baseline
         self._macroLegalization(state, last_t, benchmark)
+        state["best_pos"] = state["pos"].clone()
+
+        # --- snapshot after phase 3 ---
+        pos_p3 = state["pos"].detach().cpu()
+        soft_disp_p3 = float((pos_p3[nh:] - pos_p2[nh:]).norm(dim=1).mean()) if benchmark.num_soft_macros > 0 else None
+        snapshots.append({"phase": "3: mLG", "hpwl": _exactHpwl(pos_p3, net_data_cpu), "overflow": None, "hard_overlaps": _legalizer._countOverlaps(pos_p3, nh, sizes_cpu), "soft_disp": soft_disp_p3})
 
         # Phase 4: cGP
         if self.soft_place and benchmark.num_soft_macros > 0:
             state["pos"] = self._cellGlobalPlacement(state["pos"], benchmark, net_data,
                                                      frame_offset=last_t + 1)
-            self._out.saveLegalFrame(last_t, state["pos"], state["prev_wl"],
-                                     state["gamma"], benchmark, state["num_macros"],
-                                     phase="3: mLG")
+
+            # --- snapshot after phase 4 ---
+            pos_p4 = state["pos"].detach().cpu()
+            ovfw_p4 = state["overflow_history"][-1] if state["overflow_history"] else None
+            self._out.saveCgpFrame(last_t, state["pos"], state["prev_wl"],
+                                   ovfw_p4, state["gamma"], benchmark, state["num_macros"])
+            soft_disp_p4 = float((pos_p4[nh:] - pos_p2[nh:]).norm(dim=1).mean())
+            snapshots.append({"phase": "4: cGP", "hpwl": _exactHpwl(pos_p4, net_data_cpu), "overflow": ovfw_p4, "hard_overlaps": _legalizer._countOverlaps(pos_p4, nh, sizes_cpu), "soft_disp": soft_disp_p4})
+
+        self._out.writeRunSummary(benchmark, snapshots)
+        self._out.close()
 
         self.last_metrics = {
             "wl": float(state["prev_wl"]),
@@ -769,6 +821,7 @@ class CometPlacer:
                 work_offs_dev.copy_(work_offs_cpu.to(work_offs_dev.device))
                 n_swapped = self._applyOrientationSizes(old_genes, rot_genes, benchmark)
                 print(f"    [rotation t={t}] {n} macro(s) rotated, {n_swapped} size-swapped")
+        self._out.log(f"  [mGP] done  iters={t + 1}")
         return t
 
     def _macroLegalization(self, state, last_t, benchmark):
@@ -778,15 +831,17 @@ class CometPlacer:
             state["pos"] = _legalizer.bumpLegalize(
                 state["pos"].cpu(), benchmark, halo_size=self.halo_legalize
             ).to(self.device)
+            last_ovfw = state["overflow_history"][-1] if state["overflow_history"] else 0.0
             self._out.saveLegalFrame(last_t, state["pos"], state["prev_wl"],
-                                     state["gamma"], benchmark, state["num_macros"])
+                                     last_ovfw, state["gamma"], benchmark, state["num_macros"])
         elif self.legalization == "spiral":
             self._out.log("  Legalizing (spiral push-out)...")
             state["pos"] = _legalizer.spiralLegalize(
                 state["pos"].cpu(), benchmark
             ).to(self.device)
+            last_ovfw = state["overflow_history"][-1] if state["overflow_history"] else 0.0
             self._out.saveLegalFrame(last_t, state["pos"], state["prev_wl"],
-                                     state["gamma"], benchmark, state["num_macros"])
+                                     last_ovfw, state["gamma"], benchmark, state["num_macros"])
 
     def _hardMacroSpread(self, state, benchmark, net_data, frame_offset=0):
         """
@@ -836,7 +891,7 @@ class CometPlacer:
                     state["pos"] = state["best_pos"].clone()
                     break
 
-            self._trackBestWl(wl_val, state)
+            self._trackBestWl(wl_val, overflow, state)
             if s % self.gamma_iters_per_update == 0:
                 self._stepGamma(state, overflow)
 
@@ -909,6 +964,8 @@ class CometPlacer:
             "overflow_history": [],
             "ref_hpwl": 1.0,
             "overflow_ema": float("inf"),
+            "stop_reason": "",
+            "conv_life": None,
         }
 
         # Scatter soft macros uniformly across the canvas as a fresh start.
@@ -946,7 +1003,7 @@ class CometPlacer:
                 grad[fixed_mask] = 0.0
                 alpha = self._stepSgd(grad, state)
 
-            self._trackBestWl(wl_val, state)
+            self._trackBestWl(wl_val, overflow, state)
             if t % self.lambda_iters_per_update == 0:
                 self._updateLambda(t, wl_val, wl_grad, den_grad, den_energy, state,
                                    overflow=overflow)
@@ -960,6 +1017,9 @@ class CometPlacer:
                     f"\u03bb={state['lambda_d']:.2e}  gamma={state['gamma']:.4f}")
 
             converged = self._checkConvergence(t, wl_val, overflow, max_den, state)
+            self._out.writeIter(t, "cGP", wl_val, overflow, alpha, state["lambda_d"],
+                                state["gamma"],
+                                stop_reason=state["stop_reason"] if converged else "")
             state["prev_wl"] = wl_val
             state["prev_overflow"] = overflow
 
@@ -971,7 +1031,7 @@ class CometPlacer:
                 break
 
         self._out.log(f"  [cGP] done  iters={t + 1}  wl={state['prev_wl']:.4f}")
-        return state["pos"]
+        return state["best_pos"]
 
     def _initState(self, benchmark, net_data):
         """Initialise all loop state variables."""
@@ -1027,6 +1087,8 @@ class CometPlacer:
             "overflow_ema": float("inf"),
             "density_mask": None,  # None = all macros contribute; set for phase 4
             "halo_size": self.halo_size,
+            "stop_reason": "",
+            "conv_life": None,
         }
 
         self._initOptimizer(state, max_step, pos)
@@ -1061,12 +1123,17 @@ class CometPlacer:
         elif self.init_placement == "quadratic":
             _qp = _importSibling("quadratic_placer")
             cfg = {"quad_b2b_iters": self.quad_b2b_iters,
-                   "quad_net_size_threshold": self.quad_net_size_threshold}
+                   "quad_net_size_threshold": self.quad_net_size_threshold,
+                   "quad_anchor_fraction": self.quad_anchor_fraction,
+                   "quad_scatter_fraction": self.quad_scatter_fraction,
+                   "seed": self.seed}
             self._out.log("  Quadratic WL init (mIP)...", flush=True)
             # quadratic_placer uses numpy/scipy and requires CPU tensors.
             cpu_net_data = {k: v.cpu() if isinstance(v, torch.Tensor) else v
                             for k, v in net_data.items()}
-            pos = _qp.quadratic_init(cpu_net_data, benchmark, cfg).to(self.device)
+            pos, scatter_ids = _qp.quadratic_init(cpu_net_data, benchmark, cfg)
+            pos = pos.to(self.device)
+            self._out.saveScatterIds(scatter_ids)
             self._out.log(f"  mIP done.")
         return pos
 
@@ -1130,7 +1197,7 @@ class CometPlacer:
                     state["a_k"] = 1.0
                 return True
 
-        self._trackBestWl(wl_val, state)
+        self._trackBestWl(wl_val, overflow, state)
         if t % self.lambda_iters_per_update == 0:
             self._updateLambda(t, wl_val, wl_grad, den_grad, den_energy, state,
                                overflow=overflow)
@@ -1140,8 +1207,6 @@ class CometPlacer:
         if state["lambda_hm"] > 1.0:
             state["lambda_hm"] = max(1.0, state["lambda_hm"] * self.lambda_hm_decay)
 
-        self._out.writeIter(t, wl_val, overflow, alpha, state["lambda_d"],
-                            state["gamma"])
         if self._out.shouldLog(t, self.max_iters):
             self._out.log(
                 f"    iter {t:4d}  wl={wl_val:.4f}  den={den_energy:.4f}  "
@@ -1149,6 +1214,9 @@ class CometPlacer:
                 f"gamma={state['gamma']:.4f}")
 
         converged = self._checkConvergence(t, wl_val, overflow, max_den, state)
+        self._out.writeIter(t, "mGP", wl_val, overflow, alpha, state["lambda_d"],
+                            state["gamma"],
+                            stop_reason=state["stop_reason"] if converged else "")
 
         state["prev_wl"] = wl_val
         state["prev_overflow"] = overflow
@@ -1178,7 +1246,9 @@ class CometPlacer:
             return _density.computeDensityGradient(
                 self.density_method, eval_pos, benchmark, self.target_density,
                 density_mask=state.get("density_mask"),
-                halo_size=state.get("halo_size", 0.0))
+                halo_size=state.get("halo_size", 0.0),
+                grid_rows=self.density_grid_rows,
+                grid_cols=self.density_grid_cols)
         return (torch.zeros_like(state["pos"]), 0.0, float("inf"), float("inf"))
 
     def _combineGradients(self, wl_grad, den_grad, state):
@@ -1301,9 +1371,9 @@ class CometPlacer:
     # Lambda schedule
     # -------------------------------------------------------------------
 
-    def _trackBestWl(self, wl_val, state):
-        """Track best WL and snapshot position."""
-        if wl_val < state["best_wl"]:
+    def _trackBestWl(self, wl_val, overflow, state):
+        """Snapshot best position: only when overflow is below stop threshold and WL improves."""
+        if overflow < self.stop_overflow and wl_val < state["best_wl"]:
             state["best_wl"] = wl_val
             state["best_pos"] = state["pos"].clone()
 
@@ -1373,22 +1443,34 @@ class CometPlacer:
     # -------------------------------------------------------------------
 
     def _checkConvergence(self, t, wl_val, overflow, max_den, state):
-        """Evaluate four stopping criteria. Returns True if converged."""
+        """Evaluate stopping criteria. Returns True if converged."""
         state["overflow_history"].append(overflow)
 
         if t < self.warmup_iters or t <= 100:
             return False
 
-        if self._checkLgamma(wl_val, overflow, state, t):
+        # Divergence exits immediately (no countdown).
+        if self.conv_divergence and self._checkDivergence(wl_val, state, t):
             return True
-        if self._checkMaxDensity(max_den, t):
-            return True
-        if self._checkPlateau(overflow, state, t):
-            return True
-        if self._checkLambdaMax(overflow, state, t):
-            return True
-        if self._checkDivergence(wl_val, state, t):
-            return True
+
+        # If countdown already started, tick it down.
+        if state["conv_life"] is not None:
+            state["conv_life"] -= 1
+            if state["conv_life"] <= 0:
+                self._out.log(f"  [converged] iter {t}: countdown elapsed")
+                return True
+            return False
+
+        # Check criteria; on first trigger, start countdown instead of stopping.
+        triggered = (
+            (self.conv_lgamma     and self._checkLgamma(wl_val, overflow, state, t))
+            or (self.conv_max_den  and self._checkMaxDensity(max_den, t, state))
+            or (self.conv_plateau  and self._checkPlateau(overflow, state, t))
+            or (self.conv_lambda_max and self._checkLambdaMax(overflow, state, t))
+        )
+        if triggered:
+            state["conv_life"] = self.convergence_countdown
+            self._out.log(f"  [converged] iter {t}: starting {self.convergence_countdown}-iter countdown")
         return False
 
     def _checkLgamma(self, wl_val, overflow, state, t):
@@ -1396,14 +1478,16 @@ class CometPlacer:
         if overflow < self.stop_overflow and wl_val > state["prev_wl"]:
             self._out.log(f"  [converged] iter {t}: overflow {overflow:.4f} "
                           f"< {self.stop_overflow} and wl rising")
+            state["stop_reason"] = "lgamma"
             return True
         return False
 
-    def _checkMaxDensity(self, max_den, t):
+    def _checkMaxDensity(self, max_den, t, state):
         """Max-density: every bin already under target."""
         if max_den < self.target_density:
             self._out.log(f"  [converged] iter {t}: max_density {max_den:.4f} "
                           f"< target {self.target_density}")
+            state["stop_reason"] = "max_density"
             return True
         return False
 
@@ -1419,6 +1503,7 @@ class CometPlacer:
                 self._out.log(f"  [plateau] iter {t}: loss avg flat "
                               f"{cur_avg:.4f} \u2248 {prev_avg:.4f} "
                               f"(rel={rel_change:.4f})")
+                state["stop_reason"] = "plateau"
                 return True
         return False
 
@@ -1436,6 +1521,7 @@ class CometPlacer:
                 self._out.log(
                     f"  [lambda-max] iter {t}: lambda at max {state['lambda_d']:.2e}, "
                     f"overflow flat at {overflow:.4f}")
+                state["stop_reason"] = "lambda_max"
                 return True
         return False
 
@@ -1451,5 +1537,6 @@ class CometPlacer:
                     f"  [diverged] iter {t}: wl {wl_val:.4f} > "
                     f"5\u00d7best {state['best_wl']:.4f}, "
                     f"ovf +{trend*100:.1f}% over {dw} iters")
+                state["stop_reason"] = "divergence"
                 return True
         return False

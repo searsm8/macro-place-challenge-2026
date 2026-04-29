@@ -26,21 +26,37 @@ Usage
 """
 
 # ── EDIT THIS SECTION ────────────────────────────────────────────────────────
-# Each key must match a param name in config.toml [params].
-# Each value is a list of candidate values to try.
-# The full Cartesian product is evaluated.
+# SWEEP: keys are config.toml param names; values are lists of candidates.
+#   The full Cartesian product of SWEEP is evaluated.
+#   If COMBOS is non-empty, every SWEEP grid point is crossed with every COMBO.
+#
+# COMBOS: explicit parameter groups (list of dicts).
+#   Each dict is merged on top of the SWEEP grid point for that run.
+#   Use this to test hand-picked combinations without a full Cartesian product.
+#   Example:
+#     SWEEP  = {"seed": [0, 1, 2, 3]}
+#     COMBOS = [
+#         {"mgp_enable": "true",  "legalization": "bump"},
+#         {"mgp_enable": "false", "legalization": "none"},
+#     ]
+#   → 4 seeds × 2 combos = 8 runs per benchmark.
+#
+# Leave COMBOS = [] to use plain Cartesian product (original behaviour).
+COMBOS: list[dict] = [
+     {"mgp_enable": "true",  "legalization": "bump"},
+     {"mgp_enable": "false", "legalization": "none"},
+]
+
 SWEEP = {
-    #"target_density": [0.50, 0.80],
     #"initial_spread": [0.01, 0.04, 0.15],
     #"warmup_iters": [0, 1, 10, 20, 40],
     #"optimizer": ["sgd", "bb_sgd", "nesterov"],
-    #"halo_size": [ 0.3, 0.4, 0.5, 0.6],
-    #"halo_size": [ 0.2, 0.3, 0.4, 0.5],
-    #"halo_legalize": [0.1, 0.15],
 
     #"lambda_pcof_upper": [1.03, 1.05],
     #"lambda_hm_init": [1, 2, 3, 5, 10, 20], #(4/23) 1 is best (disabled density boost)
     #"soft_place": ["False", "True"],
+    #"soft_place_iters": [1000, 3000, 5000],
+    #"lambda_max": [25000],
     #"initial_placement": ["none", "center", "quadratic"],
     #"initial_placement": ["none", "quadratic"],
     #"initial_placement": ["center"],
@@ -61,8 +77,19 @@ SWEEP = {
     #"gamma_decay": [0.991, 0.992, 0.993, 0.994],
     #"gamma": ["auto", "ovfw"],
 
-    "quad_b2b_iters": [0, 1, 3, 6],     
-    "quad_net_size_threshold": [20, 80, 150],
+    #"quad_b2b_iters": [0, 1, 3, 6],     
+    #"quad_net_size_threshold": [20, 80, 150],
+    #"quad_anchor_fraction": [ 0, .1, .2, 0.97], # fraction of movable macros (ranked by area×net_degree) fixed as internal anchors in stage 1 (0 = disabled)
+    #"density_grid_size": [75, 128, 256, 512],
+    #"target_density": [0.65, .70, .75, 0.80],
+    #"density_grid_size": [128,256,512,1024],
+    #"target_density": [0.65],
+    #"quad_scatter_fraction": [0.05, 0.1, 0.125, 0.15], # fraction of movable macros (ranked by area×net_degree) randomly scattered in stage 1 (0 = disabled)
+    #"halo_size": [ 0.3, 0.4, 0.5, 0.6],
+    #"halo_size": [ 0.3],
+    #"halo_legalize": [0.1, 0.15],
+    "seed": [0, 1, 2, 3], # random seed for initial placement and mGP; affects all stochasticity when deterministic=false
+    #"mip_only": ["False", "True"], # skip mGP/cGP — legalize from mIP positions and return immediately (fast proxy for scatter quality)
 }
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -91,10 +118,12 @@ UV          = "/home/msears/.local/bin/uv"
 IBM_BENCHMARKS = [
     #"ibm01", "ibm02", "ibm03", "ibm04", "ibm06", "ibm07", "ibm08", "ibm09",
     #"ibm10", "ibm11", "ibm12", "ibm13", "ibm14", "ibm15", "ibm16", "ibm17", "ibm18",
-    "ibm01", "ibm04", "ibm14", # small+medium+large subset for quick testing
+
+    # small+medium+large subset for quick testing
+    "ibm01", "ibm04", "ibm14", # best avg for this subset: 1.3782
 ]
 
-METRIC_COLS = ["proxy", "wl", "den", "cong", "valid", "time_s", "iters", "overlaps"]
+METRIC_COLS = ["proxy", "wl", "den", "cong", "valid", "time_s", "mgp_iters", "cgp_iters", "overlaps"]
 
 
 # ── Config helpers ─────────────────────────────────────────────────────────────
@@ -144,7 +173,8 @@ def parse_result(stdout: str, benchmark: str) -> dict | None:
         "cong":      None,
         "valid":     None,
         "time_s":    None,
-        "iters":     None,
+        "mgp_iters": None,
+        "cgp_iters": None,
         "overlaps":  None,
     }
 
@@ -168,10 +198,13 @@ def parse_result(stdout: str, benchmark: str) -> dict | None:
         if m2:
             result["overlaps"] = int(m2.group(1))
 
-        # Iteration count: "  iters=500"
-        m3 = re.search(r"\biters=(\d+)", line)
+        # Iteration counts: "[mGP] done  iters=N" and "[cGP] done  iters=N"
+        m3 = re.search(r"\[mGP\] done\s+iters=(\d+)", line)
         if m3:
-            result["iters"] = int(m3.group(1))
+            result["mgp_iters"] = int(m3.group(1))
+        m4 = re.search(r"\[cGP\] done\s+iters=(\d+)", line)
+        if m4:
+            result["cgp_iters"] = int(m4.group(1))
 
     if result["proxy"] is None:
         return None
@@ -373,9 +406,17 @@ def main():
 
     original_config = CONFIG_PATH.read_text()
 
-    sweep_keys = list(SWEEP.keys())
-    combos     = list(itertools.product(*SWEEP.values()))
-    n_combos   = len(combos)
+    # Build list of parameter dicts: SWEEP grid crossed with COMBOS (if any).
+    _sweep_vals = list(SWEEP.values()) if SWEEP else [()]
+    _sweep_dicts = [
+        dict(zip(SWEEP.keys(), c)) for c in itertools.product(*_sweep_vals)
+    ] if SWEEP else [{}]
+    if COMBOS:
+        param_dicts = [{**sd, **co} for sd in _sweep_dicts for co in COMBOS]
+    else:
+        param_dicts = _sweep_dicts
+    sweep_keys = list(dict.fromkeys(k for d in param_dicts for k in d))
+    n_combos   = len(param_dicts)
 
     if args.all:
         benchmarks = IBM_BENCHMARKS
@@ -399,8 +440,7 @@ def main():
     # moving to the next.
     jobs: dict[str, list] = {b: [] for b in benchmarks}
     for benchmark in benchmarks:
-        for combo_id, combo in enumerate(combos, 1):
-            params  = dict(zip(sweep_keys, combo))
+        for combo_id, params in enumerate(param_dicts, 1):
             run_dir = sweep_run_dir / benchmark / f"run_{combo_id:03d}"
             jobs[benchmark].append((run_dir, benchmark, combo_id, params))
 

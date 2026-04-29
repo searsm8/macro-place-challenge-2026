@@ -15,6 +15,16 @@ Star    — for large nets (k > threshold): connect every movable pin to the
           centroid of the fixed pins in the same net.  Falls back to skip
           if no fixed pins exist.
 
+Two-stage anchor placement (quad_anchor_fraction > 0)
+------------------------------------------------------
+Stage 1: Select the top anchor_fraction of movable macros by area×net_degree.
+         Run a CLIQUE-only solve with only ports+fixed macros as anchors to
+         position these anchor macros.  Non-anchor movables are held at canvas
+         centre for this solve (they contribute spring force but no unknowns).
+Stage 2: Fix the anchors at their stage-1 positions.  Run the full CLIQUE+B2B
+         solve for all remaining movable macros, now with both ports and internal
+         anchors as fixed infrastructure.
+
 The spring equation for a pair (pin a on macro i, pin b on macro j):
     energy = w * (xi + oa - xj - ob)²
     ∂/∂xi  → L[i,i] += w,  L[i,j] -= w,  b[i] += w*(ob - oa)
@@ -41,10 +51,13 @@ def quadratic_init(net_data, benchmark, cfg):
 
     Returns
     -------
-    pos : FloatTensor [num_macros, 2]  — initial positions clamped to canvas.
+    pos         : FloatTensor [num_macros, 2]  — initial positions clamped to canvas.
+    scatter_ids : np.ndarray of macro indices that were scattered (empty if none).
     """
     b2b_iters        = cfg.get("quad_b2b_iters", 3)
     net_size_thresh  = cfg.get("quad_net_size_threshold", 50)
+    anchor_fraction  = cfg.get("quad_anchor_fraction", 0.0)
+    scatter_fraction = cfg.get("quad_scatter_fraction", 0.0)
 
     num_macros = benchmark.num_macros
     canvas_w   = float(benchmark.canvas_width)
@@ -57,14 +70,8 @@ def quadratic_init(net_data, benchmark, cfg):
     n_mov         = len(movable_ids)
 
     if n_mov == 0:
-        # All macros fixed — nothing to do.
-        return benchmark.macro_positions[:num_macros].clone().float()
+        return benchmark.macro_positions[:num_macros].clone().float(), np.empty(0, dtype=np.int64)
 
-    # global macro index → local movable index (−1 if fixed)
-    g2l = np.full(num_macros, -1, dtype=np.int64)
-    g2l[movable_ids] = np.arange(n_mov)
-
-    # macro centers [M, 2] — used to compute effective positions of fixed-macro pins
     macro_centers = benchmark.macro_positions[:num_macros].numpy().astype(np.float64)
 
     # ── Unpack net_data ──────────────────────────────────────────────────────
@@ -74,65 +81,203 @@ def quadratic_init(net_data, benchmark, cfg):
     is_macro_np  = net_data["is_macro"].numpy()     # [P] bool
     num_nets     = net_data["num_nets"]
 
-    # ── Per-pin classification ───────────────────────────────────────────────
-    # Safe index for numpy indexing (ports remapped to 0, then masked out)
-    pin_safe = np.where(~is_macro_np, 0, macro_ids_np)
-
-    # A pin is "fixed" if it is a port (is_macro=False) OR its macro is fixed.
-    pin_is_fixed = ~is_macro_np | fixed_mask_np[pin_safe]
-
-    # Local movable index per pin (−1 if fixed)
-    pin_local = np.where(pin_is_fixed, np.int64(-1), g2l[pin_safe])
-
-    # Effective fixed position per pin:
-    #   port      → offsets (already absolute)
-    #   fixed macro → macro_center + offset
-    pin_fixed_eff = np.where(
-        (~is_macro_np)[:, None],
-        offsets_np,
-        macro_centers[pin_safe] + offsets_np,
-    )  # [P, 2]
-
-    # ── Sort pins by net for O(1) per-net slicing ────────────────────────────
+    # ── Sort pins by net once — shared by both stages ────────────────────────
     order     = np.argsort(net_ids_np, kind="stable")
     s_net     = net_ids_np[order]
-    s_loc     = pin_local[order]       # local movable idx or −1
-    s_fix     = pin_is_fixed[order]    # bool
-    s_fpos    = pin_fixed_eff[order]   # [P, 2] effective fixed pos
-    s_ofs     = offsets_np[order]      # [P, 2] offset from macro center
+    s_mid     = macro_ids_np[order]   # macro id per sorted pin
+    s_ism     = is_macro_np[order]    # is_macro per sorted pin
+    s_ofs     = offsets_np[order]     # [P, 2] offset per sorted pin
 
     net_starts = np.searchsorted(s_net, np.arange(num_nets), side="left")
     net_ends   = np.searchsorted(s_net, np.arange(num_nets), side="right")
 
-    # ── Initial guess: canvas centre ─────────────────────────────────────────
-    pos = np.zeros((n_mov, 2), dtype=np.float64)
+    # ── Scatter-and-lock: randomly place biggest hard macros, then fix them ──
+    if scatter_fraction > 0:
+        # Candidate pool: movable hard macros only
+        hard_movable = movable_ids[movable_ids < benchmark.num_hard_macros]
+        if len(hard_movable) > 1:
+            # Select largest until cumulative area >= scatter_fraction * total hard-movable area
+            areas = (half_w * half_h)[hard_movable]
+            ranked = np.argsort(areas)[::-1]
+            cutoff = np.searchsorted(np.cumsum(areas[ranked]), scatter_fraction * areas.sum(), side="left")
+            n_scatter = min(int(cutoff) + 1, len(hard_movable) - 1)
+            scatter_ids = hard_movable[ranked[:n_scatter]]
+            remain_ids  = movable_ids[~np.isin(movable_ids, scatter_ids)]
+
+            # Random placement within valid canvas bounds
+            rng = np.random.default_rng(cfg.get("seed", 42))
+            scatter_pos = np.empty((n_scatter, 2), dtype=np.float64)
+            scatter_pos[:, 0] = rng.uniform(half_w[scatter_ids], canvas_w - half_w[scatter_ids])
+            scatter_pos[:, 1] = rng.uniform(half_h[scatter_ids], canvas_h - half_h[scatter_ids])
+
+            # Fix scattered macros; solve quadratic for the rest
+            fixed_s2   = fixed_mask_np.copy()
+            fixed_s2[scatter_ids] = True
+            centers_s2 = macro_centers.copy()
+            centers_s2[scatter_ids] = scatter_pos
+
+            g2l_s2 = np.full(num_macros, -1, dtype=np.int64)
+            g2l_s2[remain_ids] = np.arange(len(remain_ids))
+
+            s_loc_s2, s_fix_s2, s_fpos_s2 = _classify_pins(
+                s_mid, s_ism, s_ofs, fixed_s2, centers_s2, g2l_s2)
+
+            pos_s2 = np.empty((len(remain_ids), 2), dtype=np.float64)
+            pos_s2[:, 0] = canvas_w / 2.0
+            pos_s2[:, 1] = canvas_h / 2.0
+            pos_s2 = _solve(pos_s2, len(remain_ids), num_nets, net_starts, net_ends,
+                            s_loc_s2, s_fix_s2, s_fpos_s2, s_ofs, net_size_thresh, b2b_pos=None)
+            _clamp(pos_s2, remain_ids, half_w, half_h, canvas_w, canvas_h)
+
+            for _ in range(b2b_iters):
+                pos_s2 = _solve(pos_s2, len(remain_ids), num_nets, net_starts, net_ends,
+                                s_loc_s2, s_fix_s2, s_fpos_s2, s_ofs, net_size_thresh, b2b_pos=pos_s2)
+                _clamp(pos_s2, remain_ids, half_w, half_h, canvas_w, canvas_h)
+
+            return _scatter_result(benchmark, num_macros, half_w, half_h, canvas_w, canvas_h,
+                                   {tuple(scatter_ids): scatter_pos, tuple(remain_ids): pos_s2}), scatter_ids
+
+    # ── Two-stage anchor placement ───────────────────────────────────────────
+    if anchor_fraction > 0:
+        anchor_ids = _select_anchors(
+            movable_ids, macro_ids_np, is_macro_np, net_ids_np,
+            half_w, half_h, anchor_fraction)
+
+        if len(anchor_ids) > 0:
+            remain_ids = movable_ids[~np.isin(movable_ids, anchor_ids)]
+
+            # Stage 1: solve for anchor positions (ports only as fixed infra).
+            # Non-anchor movables are held at canvas centre — they act as weak
+            # fixed springs pulling anchors inward, but have no unknowns.
+            fixed_s1    = fixed_mask_np.copy()
+            fixed_s1[anchor_ids] = False
+            fixed_s1[remain_ids] = True   # non-anchor movables are fixed at canvas centre
+            centers_s1  = macro_centers.copy()
+            centers_s1[remain_ids, 0] = canvas_w / 2.0
+            centers_s1[remain_ids, 1] = canvas_h / 2.0
+
+            g2l_s1 = np.full(num_macros, -1, dtype=np.int64)
+            g2l_s1[anchor_ids] = np.arange(len(anchor_ids))
+
+            s_loc_s1, s_fix_s1, s_fpos_s1 = _classify_pins(
+                s_mid, s_ism, s_ofs, fixed_s1, centers_s1, g2l_s1)
+
+            pos_s1 = np.empty((len(anchor_ids), 2), dtype=np.float64)
+            pos_s1[:, 0] = canvas_w / 2.0
+            pos_s1[:, 1] = canvas_h / 2.0
+            pos_s1 = _solve(pos_s1, len(anchor_ids), num_nets, net_starts, net_ends,
+                            s_loc_s1, s_fix_s1, s_fpos_s1, s_ofs, net_size_thresh, b2b_pos=None)
+            _clamp(pos_s1, anchor_ids, half_w, half_h, canvas_w, canvas_h)
+
+            # Stage 2: fix anchors at stage-1 positions; solve for remaining macros.
+            fixed_s2   = fixed_mask_np.copy()
+            fixed_s2[anchor_ids] = True
+            centers_s2 = macro_centers.copy()
+            centers_s2[anchor_ids] = pos_s1
+
+            g2l_s2 = np.full(num_macros, -1, dtype=np.int64)
+            g2l_s2[remain_ids] = np.arange(len(remain_ids))
+
+            s_loc_s2, s_fix_s2, s_fpos_s2 = _classify_pins(
+                s_mid, s_ism, s_ofs, fixed_s2, centers_s2, g2l_s2)
+
+            pos_s2 = np.empty((len(remain_ids), 2), dtype=np.float64)
+            pos_s2[:, 0] = canvas_w / 2.0
+            pos_s2[:, 1] = canvas_h / 2.0
+            pos_s2 = _solve(pos_s2, len(remain_ids), num_nets, net_starts, net_ends,
+                            s_loc_s2, s_fix_s2, s_fpos_s2, s_ofs, net_size_thresh, b2b_pos=None)
+            _clamp(pos_s2, remain_ids, half_w, half_h, canvas_w, canvas_h)
+
+            for _ in range(b2b_iters):
+                pos_s2 = _solve(pos_s2, len(remain_ids), num_nets, net_starts, net_ends,
+                                s_loc_s2, s_fix_s2, s_fpos_s2, s_ofs, net_size_thresh, b2b_pos=pos_s2)
+                _clamp(pos_s2, remain_ids, half_w, half_h, canvas_w, canvas_h)
+
+            return _scatter_result(benchmark, num_macros, half_w, half_h, canvas_w, canvas_h,
+                                   {tuple(anchor_ids): pos_s1, tuple(remain_ids): pos_s2}), np.empty(0, dtype=np.int64)
+
+    # ── Standard single-stage path (anchor_fraction = 0) ────────────────────
+    g2l = np.full(num_macros, -1, dtype=np.int64)
+    g2l[movable_ids] = np.arange(n_mov)
+
+    s_loc, s_fix, s_fpos = _classify_pins(
+        s_mid, s_ism, s_ofs, fixed_mask_np, macro_centers, g2l)
+
+    pos = np.empty((n_mov, 2), dtype=np.float64)
     pos[:, 0] = canvas_w / 2.0
     pos[:, 1] = canvas_h / 2.0
-
-    # ── CLIQUE warm-start solve ───────────────────────────────────────────────
     pos = _solve(pos, n_mov, num_nets, net_starts, net_ends,
                  s_loc, s_fix, s_fpos, s_ofs, net_size_thresh, b2b_pos=None)
     _clamp(pos, movable_ids, half_w, half_h, canvas_w, canvas_h)
 
-    # ── B2B refinement ────────────────────────────────────────────────────────
     for _ in range(b2b_iters):
         pos = _solve(pos, n_mov, num_nets, net_starts, net_ends,
                      s_loc, s_fix, s_fpos, s_ofs, net_size_thresh, b2b_pos=pos)
         _clamp(pos, movable_ids, half_w, half_h, canvas_w, canvas_h)
 
-    # ── Scatter back into full [num_macros, 2] tensor ─────────────────────────
+    return _scatter_result(benchmark, num_macros, half_w, half_h, canvas_w, canvas_h,
+                           {tuple(movable_ids): pos}), np.empty(0, dtype=np.int64)
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _select_anchors(movable_ids, macro_ids_np, is_macro_np, net_ids_np,
+                    half_w, half_h, anchor_fraction):
+    """
+    Return global IDs of the top anchor_fraction movable macros by area*net_degree.
+    Always leaves at least one non-anchor movable.
+    """
+    num_macros = len(half_w)
+
+    macro_mask = is_macro_np & (macro_ids_np >= 0)
+    if macro_mask.any():
+        pairs = np.unique(
+            np.stack([macro_ids_np[macro_mask], net_ids_np[macro_mask]], axis=1), axis=0)
+        net_degree = np.bincount(pairs[:, 0], minlength=num_macros).astype(np.float64)
+    else:
+        net_degree = np.zeros(num_macros, dtype=np.float64)
+
+    area   = (half_w * half_h).astype(np.float64)
+    scores = area * net_degree
+
+    n_anchors = max(1, int(round(len(movable_ids) * anchor_fraction)))
+    n_anchors = min(n_anchors, len(movable_ids) - 1)
+
+    ranked = np.argsort(scores[movable_ids])[::-1]
+    return movable_ids[ranked[:n_anchors]]
+
+
+def _classify_pins(s_mid, s_ism, s_ofs, fixed_mask, macro_centers, g2l):
+    """
+    Classify sorted pins as fixed or movable given a fixed_mask and g2l mapping.
+    Returns (s_loc, s_fix, s_fpos) ready for _solve.
+    """
+    pin_safe = np.where(~s_ism, 0, s_mid)
+    s_fix    = ~s_ism | fixed_mask[pin_safe]
+    s_loc    = np.where(s_fix, np.int64(-1), g2l[pin_safe])
+    s_fpos   = np.where(
+        (~s_ism)[:, None],
+        s_ofs,
+        macro_centers[pin_safe] + s_ofs,
+    )
+    return s_loc, s_fix, s_fpos
+
+
+def _scatter_result(benchmark, num_macros, half_w, half_h, canvas_w, canvas_h, id_pos_map):
+    """Write solved positions back into a full [num_macros, 2] float tensor."""
     result = benchmark.macro_positions[:num_macros].clone().float()
-    result[movable_ids] = torch.from_numpy(pos.astype(np.float32))
+    for ids, pos in id_pos_map.items():
+        ids = np.array(ids)
+        if len(ids):
+            result[ids] = torch.from_numpy(pos.astype(np.float32))
     hw = torch.from_numpy(half_w.astype(np.float32))
     hh = torch.from_numpy(half_h.astype(np.float32))
     result[:, 0] = result[:, 0].clamp(hw, canvas_w - hw)
     result[:, 1] = result[:, 1].clamp(hh, canvas_h - hh)
     return result
 
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
 
 def _clamp(pos, movable_ids, half_w, half_h, canvas_w, canvas_h):
     """Clamp movable-macro positions in-place."""
@@ -181,7 +326,6 @@ def _solve(current_pos, n_mov, num_nets, net_starts, net_ends,
                                 rows_y, cols_y, vals_y, b_y)
         else:
             # ── B2B ─────────────────────────────────────────────────────────
-            # Compute effective positions of all pins in this net.
             eff = np.empty((kp, 2), dtype=np.float64)
             for pi in range(kp):
                 if fix[pi]:
@@ -270,13 +414,11 @@ def _add_b2b_net(loc, fix, fpos, ofs, eff,
 
         kp = len(loc)
         for pi in range(kp):
-            # Connect pi → min_p (if pi is not already the min)
             if pi != min_p:
                 _add_spring(loc[pi], loc[min_p], fix[pi], fix[min_p],
                             ofs[pi, dim], ofs[min_p, dim],
                             fpos[pi, dim], fpos[min_p, dim], w,
                             rows, cols, vals, b)
-            # Connect pi → max_p (if pi is not already the max)
             if pi != max_p:
                 _add_spring(loc[pi], loc[max_p], fix[pi], fix[max_p],
                             ofs[pi, dim], ofs[max_p, dim],

@@ -35,9 +35,10 @@ Usage:
 
 import argparse
 import importlib.util
+import multiprocessing
 import sys
 import tempfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import torch
@@ -130,7 +131,7 @@ def render_run(
         print(f"  skip  {run_dir.relative_to(REPO_ROOT)}  (no frames after step={args.step})")
         return False
 
-    cfg_names, cfg_n_random = ftg._load_visualizer_config()
+    cfg_names, cfg_n_random, _cfg_n_scatter = ftg._load_visualizer_config()
     highlight_ids = ftg.resolve_highlight_ids(benchmark, cfg_names, cfg_n_random) or None
 
     pil_frames: list[Image.Image] = []
@@ -208,7 +209,8 @@ def main():
     ok = err = 0
 
     futures = {}
-    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+    ctx = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
         for run_dir, bench_name in runs:
             fut = executor.submit(
                 render_run, run_dir, bench_name,

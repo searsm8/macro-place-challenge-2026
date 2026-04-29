@@ -151,6 +151,14 @@ class OutputManager:
         self.log(f"  Net topology    -> {frames_dir}/net_edges.pt")
         self._bench_frames_dir = frames_dir
 
+    def saveScatterIds(self, scatter_ids):
+        """Save scattered macro indices to scatter_ids.pt (empty array if none)."""
+        if self._bench_frames_dir is None or not self.record_frames:
+            return
+        import torch, numpy as np
+        torch.save({"scatter_ids": torch.from_numpy(np.asarray(scatter_ids, dtype=np.int64))},
+                   self._bench_frames_dir / "scatter_ids.pt")
+
     def openIterLog(self, benchmark):
         """Open iterations.dat for writing per-iteration metrics."""
         if not self.record_iters:
@@ -158,15 +166,16 @@ class OutputManager:
         iter_path = Path(self.frames_dir).parent / "data" / benchmark.name / "iterations.dat"
         iter_path.parent.mkdir(parents=True, exist_ok=True)
         self._iter_fh = open(iter_path, "w")
-        self._iter_fh.write("Iter, HPWL, OVFW, alpha, lambda, gamma\n")
+        self._iter_fh.write("Iter, phase, HPWL, OVFW, alpha, lambda, gamma, stop_reason\n")
         self.log(f"  Iteration log   -> {iter_path}")
 
-    def writeIter(self, iter_num, wl_loss, overflow, alpha, lambda_d, gamma):
+    def writeIter(self, iter_num, phase, wl_loss, overflow, alpha, lambda_d, gamma,
+                  stop_reason=""):
         """Write one row to iterations.dat."""
         if self._iter_fh is not None:
             self._iter_fh.write(
-                f"{iter_num+1:04d}, {wl_loss:.4e}, {overflow:.4e}, "
-                f"{alpha:.4e}, {lambda_d:.4e}, {gamma:.4e}\n")
+                f"{iter_num+1:04d}, {phase}, {wl_loss:.4e}, {overflow:.4e}, "
+                f"{alpha:.4e}, {lambda_d:.4e}, {gamma:.4e}, {stop_reason}\n")
 
     def shouldLog(self, iter_num, max_iters):
         """Return True if this iteration should print a progress line."""
@@ -195,6 +204,39 @@ class OutputManager:
             "num_hard": benchmark.num_hard_macros,
         }, self._bench_frames_dir / f"frame_{iter_num:05d}.pt")
 
+    def renderMipPng(self, benchmark):
+        """Render frame_mip.pt to a PNG using the frames_to_gif renderer."""
+        if not self.record_frames or self._bench_frames_dir is None:
+            return
+        mip_pt = self._bench_frames_dir / "frame_mip.pt"
+        net_pt = self._bench_frames_dir / "net_edges.pt"
+        scatter_pt = self._bench_frames_dir / "scatter_ids.pt"
+        if not mip_pt.exists():
+            return
+
+        import sys
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        if str(repo_root / "scripts") not in sys.path:
+            sys.path.insert(0, str(repo_root / "scripts"))
+        import frames_to_gif as ftg
+
+        frame_data = torch.load(mip_pt, weights_only=False)
+        net_edges  = torch.load(net_pt, weights_only=False) if net_pt.exists() else None
+
+        highlight_ids = None
+        if scatter_pt.exists():
+            data = torch.load(scatter_pt, weights_only=True)
+            ids = data["scatter_ids"].tolist()
+            if ids:
+                highlight_ids = set(ids)
+
+        out_path = self._bench_frames_dir / "mip_placement.png"
+        ftg.render_frame(frame_data, benchmark, net_edges, net_alpha=0.1,
+                         save_path=str(out_path), dpi=150,
+                         highlight_ids=highlight_ids,
+                         label_override="mIP placement")
+        self.log(f"  mIP image       -> {out_path}")
+
     def saveMipFrame(self, pos, benchmark, num_macros):
         """Save the quadratic-init (mIP) placement as frame_mip.pt."""
         if not self.record_frames or self._bench_frames_dir is None:
@@ -216,9 +258,9 @@ class OutputManager:
             "num_hard": benchmark.num_hard_macros,
         }, self._bench_frames_dir / "frame_mip.pt")
 
-    def saveLegalFrame(self, iter_num, pos, wl_val, gamma, benchmark, num_macros,
-                       phase="3: mLG"):
-        """Save the legalized placement as frame_legal.pt."""
+    def _savePhaseFrame(self, filename, iter_num, pos, wl_val, overflow, gamma,
+                        benchmark, num_macros, phase):
+        """Save a named phase-boundary frame snapshot."""
         if not self.record_frames or self._bench_frames_dir is None:
             return
         torch.save({
@@ -226,7 +268,7 @@ class OutputManager:
             "positions": pos.detach().cpu().clone(),
             "wl_loss": wl_val,
             "den_loss": 0.0,
-            "overflow": 0.0,
+            "overflow": overflow,
             "lambda_d": 0.0,
             "alpha": 0.0,
             "gamma": gamma,
@@ -236,7 +278,38 @@ class OutputManager:
             "canvas_height": float(benchmark.canvas_height),
             "macro_sizes": benchmark.macro_sizes[:num_macros].cpu().clone(),
             "num_hard": benchmark.num_hard_macros,
-        }, self._bench_frames_dir / "frame_legal.pt")
+        }, self._bench_frames_dir / filename)
+
+    def saveLegalFrame(self, iter_num, pos, wl_val, overflow, gamma, benchmark, num_macros):
+        """Save the legalized (mLG) placement as frame_legal.pt."""
+        self._savePhaseFrame("frame_legal.pt", iter_num, pos, wl_val, overflow,
+                             gamma, benchmark, num_macros, phase="3: mLG")
+
+    def saveCgpFrame(self, iter_num, pos, wl_val, overflow, gamma, benchmark, num_macros):
+        """Save the post-cGP placement as frame_cgp.pt."""
+        self._savePhaseFrame("frame_cgp.pt", iter_num, pos, wl_val, overflow,
+                             gamma, benchmark, num_macros, phase="4: cGP")
+
+    def writeRunSummary(self, benchmark, snapshots):
+        """
+        Write a per-phase metrics table to run_summary.md.
+
+        snapshots: list of dicts with keys:
+          phase, hpwl, hard_overlaps, overflow (optional), soft_disp (optional)
+        """
+        out_path = Path(self.frames_dir).parent / "data" / benchmark.name / "run_summary.md"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w") as fh:
+            fh.write(f"# Run Summary: {benchmark.name}\n\n")
+            fh.write(f"| {'Phase':<14} | {'Exact HPWL':>12} | {'Overflow':>10} | "
+                     f"{'Hard Overlaps':>13} | {'Soft Disp (avg)':>15} |\n")
+            fh.write(f"|{'-'*16}|{'-'*14}|{'-'*12}|{'-'*15}|{'-'*17}|\n")
+            for s in snapshots:
+                ovfw  = f"{s['overflow']:.4f}"  if s.get('overflow')  is not None else "—"
+                sdisp = f"{s['soft_disp']:.4f}" if s.get('soft_disp') is not None else "—"
+                fh.write(f"| {s['phase']:<14} | {s['hpwl']:>12.2f} | {ovfw:>10} | "
+                         f"{s['hard_overlaps']:>13} | {sdisp:>15} |\n")
+        self.log(f"  Run summary     -> {out_path}")
 
     def close(self):
         """Close the iteration log file."""
