@@ -64,79 +64,59 @@ def _fitsCanvas(cx, cy, w, h, canvas_w, canvas_h):
 # Bump legalization — Jacobi simultaneous pairwise SAT MTV
 # ---------------------------------------------------------------------------
 
-def _jacobiPass(pos, num_hard, phys_sizes, eff_sizes, fixed,
+def _jacobiPass(pos, n, half_sum_ew, half_sum_eh, upper,
+                pw, ph, pw_half, ph_half, not_fixed, fixed,
                 canvas_w, canvas_h, margin, damping):
     """
     One vectorized Jacobi bump pass.
 
-    Reads all positions once at the start of this pass, computes the
-    minimum-translation-vector (MTV) push for every overlapping pair,
-    accumulates net displacements per macro via scatter_add, then applies
-    them all simultaneously with a damping factor.
-
-    phys_sizes : physical macro dimensions — used for canvas clamping and
-                 area-weighted split (actual mass matters for priority).
-    eff_sizes  : effective dimensions including halo — used for overlap
-                 detection so the legalizer enforces the same clearance as
-                 the density force.
+    Precomputed pass-invariant args (built once in bumpLegalize):
+      half_sum_ew/eh : (ew[i]+ew[j])/2 outer sums  [n, n]
+      upper          : upper-triangle bool mask      [n, n]
+      pw/ph          : physical sizes                [n]
+      pw_half/ph_half: physical half-sizes           [n]
+      not_fixed      : ~fixed bool tensor            [n]
+      fixed          : fixed flags bool tensor       [n]
 
     Returns (num_overlapping_pairs, num_unresolvable).
     """
-    n = num_hard
     cx = pos[:n, 0]
     cy = pos[:n, 1]
-    ew = eff_sizes[:n, 0]
-    eh = eff_sizes[:n, 1]
-    pw = phys_sizes[:n, 0]
-    ph = phys_sizes[:n, 1]
-
-    # Pairwise displacement vectors: dx[i,j] = cx[i] - cx[j]  (i pushed away from j)
-    dx = cx.unsqueeze(1) - cx.unsqueeze(0)   # [n, n]
-    dy = cy.unsqueeze(1) - cy.unsqueeze(0)
-
-    # Overlap on each axis for every pair
-    ov_x = (ew.unsqueeze(1) + ew.unsqueeze(0)) * 0.5 - dx.abs()   # [n, n]
-    ov_y = (eh.unsqueeze(1) + eh.unsqueeze(0)) * 0.5 - dy.abs()
-
-    # Upper-triangle overlapping pairs only
-    upper = torch.triu(torch.ones(n, n, dtype=torch.bool), diagonal=1)
-    mask = (ov_x > 0) & (ov_y > 0) & upper
+    dx_mat = cx.unsqueeze(1) - cx.unsqueeze(0)
+    dy_mat = cy.unsqueeze(1) - cy.unsqueeze(0)
+    ov_x_mat = half_sum_ew - dx_mat.abs()
+    ov_y_mat = half_sum_eh - dy_mat.abs()
+    mask = (ov_x_mat > 0) & (ov_y_mat > 0) & upper
     i_idx, j_idx = mask.nonzero(as_tuple=True)
     count = i_idx.numel()
     if count == 0:
         return 0, 0
 
-    ov_x_p = ov_x[i_idx, j_idx]
-    ov_y_p = ov_y[i_idx, j_idx]
-    dxp = dx[i_idx, j_idx]
-    dyp = dy[i_idx, j_idx]
+    ov_x_p = ov_x_mat[i_idx, j_idx]
+    ov_y_p = ov_y_mat[i_idx, j_idx]
+    dxp    = dx_mat[i_idx, j_idx]
+    dyp    = dy_mat[i_idx, j_idx]
 
-    # Handle coincident macros: break tie toward +x
     coincident = (dxp == 0) & (dyp == 0)
     dxp = torch.where(coincident, torch.ones_like(dxp), dxp)
+    sign_x = dxp.sign()
+    sign_y = dyp.sign()
 
-    sign_x = torch.where(dxp >= 0, torch.ones_like(dxp), -torch.ones_like(dxp))
-    sign_y = torch.where(dyp >= 0, torch.ones_like(dyp), -torch.ones_like(dyp))
-
-    # Minimum-overlap axis push
     push_x_axis = ov_x_p <= ov_y_p
     push_x = torch.where(push_x_axis, sign_x * (ov_x_p + margin), torch.zeros_like(ov_x_p))
     push_y = torch.where(~push_x_axis, sign_y * (ov_y_p + margin), torch.zeros_like(ov_y_p))
 
-    # Area-weighted split using physical sizes as proxy for mass
     ai = pw[i_idx] * ph[i_idx]
     aj = pw[j_idx] * ph[j_idx]
     total_a = ai + aj
-    fi = fixed[i_idx].bool()
-    fj = fixed[j_idx].bool()
+    fi = fixed[i_idx]
+    fj = fixed[j_idx]
     both_fixed = fi & fj
+    frac_i = torch.where(fi, torch.zeros_like(ai),
+              torch.where(fj, torch.ones_like(ai),  aj / total_a))
+    frac_j = torch.where(fj, torch.zeros_like(aj),
+              torch.where(fi, torch.ones_like(aj),  ai / total_a))
 
-    frac_i = torch.where(fi,  torch.zeros_like(ai),
-              torch.where(fj,  torch.ones_like(ai),  aj / total_a))
-    frac_j = torch.where(fj,  torch.zeros_like(aj),
-              torch.where(fi,  torch.ones_like(aj),  ai / total_a))
-
-    # Accumulate displacements with scatter_add
     delta_x = torch.zeros(n, dtype=pos.dtype)
     delta_y = torch.zeros(n, dtype=pos.dtype)
     delta_x.scatter_add_(0, i_idx, push_x * frac_i)
@@ -144,14 +124,8 @@ def _jacobiPass(pos, num_hard, phys_sizes, eff_sizes, fixed,
     delta_x.scatter_add_(0, j_idx, -push_x * frac_j)
     delta_y.scatter_add_(0, j_idx, -push_y * frac_j)
 
-    # Apply with damping; clamp to canvas using per-macro physical bounds
-    not_fixed = ~fixed[:n].bool()
-    pw_half = pw * 0.5
-    ph_half = ph * 0.5
-    new_x = pos[:n, 0] + damping * delta_x
-    new_y = pos[:n, 1] + damping * delta_y
-    new_x = torch.maximum(pw_half, torch.minimum(canvas_w - pw_half, new_x))
-    new_y = torch.maximum(ph_half, torch.minimum(canvas_h - ph_half, new_y))
+    new_x = (pos[:n, 0] + damping * delta_x).clamp(pw_half, canvas_w - pw_half)
+    new_y = (pos[:n, 1] + damping * delta_y).clamp(ph_half, canvas_h - ph_half)
     pos[:n, 0] = torch.where(not_fixed, new_x, pos[:n, 0])
     pos[:n, 1] = torch.where(not_fixed, new_y, pos[:n, 1])
 
@@ -172,12 +146,13 @@ def _gaussSeidelCleanup(pos, num_hard, phys_sizes, eff_sizes, fixed,
     ew = eff_sizes[:num_hard, 0]
     eh = eff_sizes[:num_hard, 1]
 
+    pairs = _findOverlappingPairs(pos, num_hard, eff_sizes)
     for _ in range(max_cleanup_passes):
-        pairs = _findOverlappingPairs(pos, num_hard, eff_sizes)
         if not pairs:
             break
         pairs.sort(reverse=True)   # deepest halo-overlap first
 
+        any_moved = False
         for _, i, j in pairs:
             cx_i = float(pos[i, 0])
             cy_i = float(pos[i, 1])
@@ -230,6 +205,11 @@ def _gaussSeidelCleanup(pos, num_hard, phys_sizes, eff_sizes, fixed,
             hpj_h = float(ph[j]) * 0.5
             pos[j, 0] = max(wpj_h, min(canvas_w - wpj_h, cx_j - push_x * frac_j))
             pos[j, 1] = max(hpj_h, min(canvas_h - hpj_h, cy_j - push_y * frac_j))
+            any_moved = True
+
+        if not any_moved:
+            break   # all remaining pairs are both-fixed or geometry-degenerate
+        pairs = _findOverlappingPairs(pos, num_hard, eff_sizes)
 
     return _countOverlaps(pos, num_hard, phys_sizes)
 
@@ -276,21 +256,36 @@ def bumpLegalize(pos, benchmark, halo_size=0.0, max_passes=80, margin_frac=5e-3,
     if num_hard == 0:
         return pos
 
+    n = num_hard
     phys_sizes = benchmark.macro_sizes          # physical dimensions
     eff_sizes  = phys_sizes * (1.0 + halo_size) # halo-inflated for overlap detection
     canvas_w = float(benchmark.canvas_width)
     canvas_h = float(benchmark.canvas_height)
-    min_dim = float(phys_sizes[:num_hard].min())
+    min_dim = float(phys_sizes[:n].min())
     margin_base = min_dim * margin_frac
     margin = margin_base
-    fixed = benchmark.macro_fixed[:num_hard]
+    fixed = benchmark.macro_fixed[:n]
+
+    # Precompute pass-invariant quantities once
+    ew = eff_sizes[:n, 0]
+    eh = eff_sizes[:n, 1]
+    pw = phys_sizes[:n, 0]
+    ph = phys_sizes[:n, 1]
+    half_sum_ew = (ew.unsqueeze(1) + ew.unsqueeze(0)) * 0.5   # [n, n]
+    half_sum_eh = (eh.unsqueeze(1) + eh.unsqueeze(0)) * 0.5
+    upper       = torch.triu(torch.ones(n, n, dtype=torch.bool), diagonal=1)
+    pw_half     = pw * 0.5
+    ph_half     = ph * 0.5
+    fixed_bool  = fixed.bool()
+    not_fixed   = ~fixed_bool
 
     best_count = float("inf")
     best_count_pass = 0
 
     for pass_num in range(1, max_passes + 1):
         count, unresolvable = _jacobiPass(
-            pos, num_hard, phys_sizes, eff_sizes, fixed,
+            pos, n, half_sum_ew, half_sum_eh, upper,
+            pw, ph, pw_half, ph_half, not_fixed, fixed_bool,
             canvas_w, canvas_h, margin, damping)
 
         if count == 0:
