@@ -107,6 +107,8 @@ class OutputManager:
         self.record_iters = output_cfg.get("record_iterations", True)
         self.frames_dir = output_cfg.get("frames_dir", "vis/frames")
         self.quiet = output_cfg.get("quiet", False)
+        self.legalization_details = output_cfg.get("legalization_details", False)
+        self.phase_banners = output_cfg.get("phase_banners", True)
 
         if os.environ.get("MSPLACER_NO_FRAMES") == "1":
             self.record_frames = False
@@ -122,6 +124,14 @@ class OutputManager:
         if not self.quiet:
             kwargs.setdefault("flush", True)
             print(msg, **kwargs)
+
+    def banner(self, label):
+        """Print a phase banner line if phase_banners is enabled."""
+        if not self.phase_banners:
+            return
+        inner = f"── {label} "
+        pad = max(0, 56 - len(inner))
+        self.log(f"  {inner}{'─' * pad}")
 
     def setupFrames(self, benchmark, net_data):
         """Create frame directory and save net topology snapshot."""
@@ -310,6 +320,12 @@ class OutputManager:
                 fh.write(f"| {s['phase']:<14} | {s['hpwl']:>12.2f} | {ovfw:>10} | "
                          f"{s['hard_overlaps']:>13} | {sdisp:>15} |\n")
         self.log(f"  Run summary     -> {out_path}")
+
+    def saveProxyScore(self, costs):
+        """Save proxy score dict to proxy_score.pt alongside the frames."""
+        if self._bench_frames_dir is None or not self.record_frames:
+            return
+        torch.save(costs, self._bench_frames_dir / "proxy_score.pt")
 
     def close(self):
         """Close the iteration log file."""

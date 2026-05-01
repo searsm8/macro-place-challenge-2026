@@ -46,8 +46,48 @@ def _importSibling(name):
 _density = _importSibling("density")
 _legalizer = _importSibling("legalizer")
 _output = _importSibling("output")
-_genetic = _importSibling("genetic")
 _rotation = _importSibling("rotation")
+
+
+# ---------------------------------------------------------------------------
+# Phase timer
+# ---------------------------------------------------------------------------
+
+class PhaseTimer:
+    """Lightweight phase-level stopwatch for placement runtime reporting."""
+
+    def __init__(self):
+        self._phases = []       # [(name, elapsed_s), ...]
+        self._active = {}       # name -> perf_counter start
+        self._total_start = time.perf_counter()
+
+    def reset(self):
+        self._phases = []
+        self._active = {}
+        self._total_start = time.perf_counter()
+
+    def start(self, name):
+        self._active[name] = time.perf_counter()
+
+    def stop(self, name):
+        t = self._active.pop(name, None)
+        if t is not None:
+            self._phases.append((name, time.perf_counter() - t))
+
+    def printReport(self):
+        total = time.perf_counter() - self._total_start
+
+        def _fmt(s):
+            return f"{s * 1000:.0f} ms" if s < 1.0 else f"{s:.2f} s "
+
+        print("\n  ── Phase timing report ──────────────────────")
+        print(f"  {'Phase':<24}  {'Time':>8}  {'%':>6}")
+        print("  " + "─" * 44)
+        for name, elapsed in self._phases:
+            pct = elapsed / total * 100 if total > 0 else 0.0
+            print(f"  {name:<24}  {_fmt(elapsed):>8}  {pct:>5.1f}%")
+        print("  " + "─" * 44)
+        print(f"  {'TOTAL':<24}  {_fmt(total):>8}  {'100.0':>5}%")
 
 
 # ---------------------------------------------------------------------------
@@ -352,9 +392,8 @@ class CometPlacer:
         self._readConvergenceParams(params)
         self._readPlacementParams(params)
         self._out = _output.OutputManager(output_cfg)
-        self._ga_config: dict = cfg.get("ga", {})
+        self._timer = PhaseTimer()
 
-        # Populated after each placement; consumed by the GA fitness oracle.
         self.last_metrics: dict = {}
 
         use_gpu = cfg.get("params", {}).get("use_gpu", True)
@@ -445,6 +484,7 @@ class CometPlacer:
         self.quad_net_size_threshold = p.get("quad_net_size_threshold", 50)
         self.quad_anchor_fraction   = p.get("quad_anchor_fraction", 0.0)
         self.quad_scatter_fraction  = p.get("quad_scatter_fraction", 0.0)
+        self.scatter_lock_mult      = p.get("quad_scatter_lock_mult", 0.0)
 
     def placeWithData(self, benchmark, net_data: dict):
         """
@@ -584,62 +624,6 @@ class CometPlacer:
                     plc.update_macro_orientation(plc_idx, self._OUR_ORI_TO_PLC[gene])
 
     # -------------------------------------------------------------------
-    # GA helpers
-    # -------------------------------------------------------------------
-
-    def _runGa(self, benchmark, net_data_base: dict) -> tuple[dict, object, object]:
-        """
-        Run the GA outer loop and return (net_data_mod, bench_mod, best_genes).
-
-        The GA evaluates curtailed placements (no legalization, fewer iters,
-        quiet output) via a lambda that instantiates a fresh CometPlacer with
-        a stripped-down config.
-        """
-        curtailed_cfg = self._buildCurtailedConfig()
-
-        def _eval(bench_mod, nd_mod):
-            p = CometPlacer(curtailed_cfg)
-            p.placeWithData(bench_mod, nd_mod)
-            return p.last_metrics
-
-        ga = _genetic.GeneticPlacer(self._ga_config)
-        self._out.log(
-            f"  GA: {ga.cfg}  "
-            f"(curtailed_iters={ga.cfg.curtailed_iters})"
-        )
-        best_chrom = ga.run(benchmark, net_data_base, _eval)
-        net_data_mod, bench_mod = best_chrom.applyToPlacement(net_data_base, benchmark)
-        return net_data_mod, bench_mod, best_chrom.genes.clone()
-
-    def _buildCurtailedConfig(self) -> dict:
-        """
-        Build a config dict for GA evaluation runs:
-        - Inherits all [params] from the current placer (same density method,
-          optimizer, lambda schedule, etc.)
-        - Overrides max_iters with ga.curtailed_iters
-        - Disables phase 2.5 (hard spread) and phase 4 (cGP) and legalization
-        - Silences all output and frame recording
-        """
-        base_cfg = _loadConfig()
-        params   = dict(base_cfg.get("params", {}))
-
-        params["max_iters"]    = self._ga_config.get("ga_curtailed_iters", 300)
-        params["hard_spread"]  = False
-        params["soft_place"]   = False
-        params["legalization"] = "none"
-
-        return {
-            "params": params,
-            "output": {
-                "quiet":             True,
-                "record_frames":     False,
-                "record_iterations": False,
-                "log_every":         999999,
-            },
-            "ga": {},  # no nested GA in curtailed runs
-        }
-
-    # -------------------------------------------------------------------
     # Top-level entry point
     # -------------------------------------------------------------------
 
@@ -658,9 +642,11 @@ class CometPlacer:
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
         start_time = time.time()
+        self._timer.reset()
 
         _output.printBenchmarkInfo(benchmark, self.density_method)
 
+        self._timer.start("setup")
         plc = _loadPlc(benchmark.name)
         if plc is None:
             print("  [warn] Could not load plc - returning initial placement",
@@ -675,16 +661,11 @@ class CometPlacer:
             return benchmark.macro_positions.clone()
         self._out.log(f"  {net_data['num_nets']} nets, {net_data['num_pins']} pins  "
                       f"({net_data['num_skipped']} nets skipped)")
+        self._timer.stop("setup")
 
         # Base net_data (all-N offsets) and gene state — used by rotation optimizer.
         net_data_base   = net_data
         current_genes   = torch.zeros(benchmark.num_hard_macros, dtype=torch.int8)
-
-        # ── Orientation pre-search (GA or genetic mode) ───────────────────
-        ga_active = (_asBool(self._ga_config.get("ga_enable", False))
-                     or self.rotation_optimizer == "genetic")
-        if ga_active:
-            net_data, benchmark, current_genes = self._runGa(benchmark, net_data_base)
 
         genes = current_genes
         nd    = net_data
@@ -719,7 +700,20 @@ class CometPlacer:
         macro_dat = Path(self._out.frames_dir).parent / "data" / benchmark.name / "macros.dat"
         _output.writeMacroDat(pos, benchmark, net_data, plc, macro_dat)
         self._out.log(f"  Macro HPWL      -> {macro_dat}")
+
+        from macro_place.objective import compute_proxy_cost
+        costs = compute_proxy_cost(pos, benchmark, plc)
+        self._out.log(
+            f"  Proxy score     : {costs['proxy_cost']:.4f}  "
+            f"(wl={costs['wirelength_cost']:.4f}  "
+            f"den={costs['density_cost']:.4f}  "
+            f"cong={costs['congestion_cost']:.4f}  "
+            f"overlaps={costs['overlap_count']})"
+        )
+        self._out.saveProxyScore(costs)
+
         self._out.log(f"  Total time: {time.time()-start_time:.1f}s")
+        self._timer.printReport()
         return full_pos
 
     # -------------------------------------------------------------------
@@ -738,23 +732,37 @@ class CometPlacer:
 
         # Phase 2: mGP
         if self.mgp_enable:
+            self._out.banner("Phase 2: mGP")
+            self._timer.start("mGP")
             last_t = self._mixedGlobalPlacement(state, benchmark, net_data, rot_genes, net_data_base, run_rotation)
+            self._timer.stop("mGP")
         else:
             self._out.log("  [mgp_enable=false] skipping mGP")
             last_t = 0
+            # Compute WL from initial placement so last_metrics has a real signal.
+            nd_cpu = {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in net_data.items()}
+            state["prev_wl"] = float(_exactHpwl(state["pos"].detach().cpu(), nd_cpu))
+            state["overflow_history"] = [1.0]  # no density info available
 
         # Phase 2.5: hard-macro spread
         self._out.log(f"  hard_spread={self.hard_spread}  "
                       f"hard_spread_iters={self.hard_spread_iters}")
         if self.hard_spread and benchmark.num_soft_macros > 0:
+            self._out.banner("Phase 2.5: hard spread")
+            self._timer.start("hard spread")
             last_t = self._hardMacroSpread(state, benchmark, net_data, frame_offset=last_t + 1)
+            self._timer.stop("hard spread")
 
         # Phase 3.5: pre-legalization rotation optimizer (skipped on locked passes)
         if run_rotation and self.rotation_optimizer in ("greedy", "anneal") and net_data_base is not None:
+            self._out.banner("Phase 3.5: rotation")
+            self._timer.start("rotation")
             self._runRotationOptimizer(
                 state["pos"], net_data, net_data_base, rot_genes, benchmark,
                 state["gamma"], plc
             )
+            self._timer.stop("rotation")
+            self._out.banner("Phase 3.5: rotation  done")
 
         # --- snapshot after phase 2 ---
         nh = benchmark.num_hard_macros
@@ -765,7 +773,11 @@ class CometPlacer:
         snapshots = [{"phase": "2: mGP", "hpwl": _exactHpwl(pos_p2, net_data_cpu), "overflow": ovfw_p2, "hard_overlaps": _legalizer._countOverlaps(pos_p2, nh, sizes_cpu), "soft_disp": None}]
 
         # Phase 3: mLG — reset best_pos to legalized result so cGP tracks from clean baseline
+        self._out.banner("Phase 3: mLG")
+        self._timer.start("mLG")
         self._macroLegalization(state, last_t, benchmark)
+        self._timer.stop("mLG")
+        self._out.banner("Phase 3: mLG  done")
         state["best_pos"] = state["pos"].clone()
 
         # --- snapshot after phase 3 ---
@@ -775,8 +787,11 @@ class CometPlacer:
 
         # Phase 4: cGP
         if self.soft_place and benchmark.num_soft_macros > 0:
+            self._out.banner("Phase 4: cGP")
+            self._timer.start("cGP")
             state["pos"] = self._cellGlobalPlacement(state["pos"], benchmark, net_data,
                                                      frame_offset=last_t + 1)
+            self._timer.stop("cGP")
 
             # --- snapshot after phase 4 ---
             pos_p4 = state["pos"].detach().cpu()
@@ -822,6 +837,7 @@ class CometPlacer:
                 n_swapped = self._applyOrientationSizes(old_genes, rot_genes, benchmark)
                 print(f"    [rotation t={t}] {n} macro(s) rotated, {n_swapped} size-swapped")
         self._out.log(f"  [mGP] done  iters={t + 1}")
+        self._out.banner(f"Phase 2: mGP  done (iters={t + 1})")
         return t
 
     def _macroLegalization(self, state, last_t, benchmark):
@@ -829,7 +845,9 @@ class CometPlacer:
         if self.legalization == "bump":
             self._out.log("  Legalizing (pairwise bump)...")
             state["pos"] = _legalizer.bumpLegalize(
-                state["pos"].cpu(), benchmark, halo_size=self.halo_legalize
+                state["pos"].cpu(), benchmark, halo_size=self.halo_legalize,
+                verbose=self._out.legalization_details,
+                quiet=self._out.quiet,
             ).to(self.device)
             last_ovfw = state["overflow_history"][-1] if state["overflow_history"] else 0.0
             self._out.saveLegalFrame(last_t, state["pos"], state["prev_wl"],
@@ -837,7 +855,9 @@ class CometPlacer:
         elif self.legalization == "spiral":
             self._out.log("  Legalizing (spiral push-out)...")
             state["pos"] = _legalizer.spiralLegalize(
-                state["pos"].cpu(), benchmark
+                state["pos"].cpu(), benchmark,
+                verbose=self._out.legalization_details,
+                quiet=self._out.quiet,
             ).to(self.device)
             last_ovfw = state["overflow_history"][-1] if state["overflow_history"] else 0.0
             self._out.saveLegalFrame(last_t, state["pos"], state["prev_wl"],
@@ -909,6 +929,7 @@ class CometPlacer:
             state["prev_overflow"] = overflow
 
         self._out.log(f"  [2.5] done  iters={self.hard_spread_iters}")
+        self._out.banner(f"Phase 2.5: hard spread  done (iters={self.hard_spread_iters})")
         return last_t
 
     def _cellGlobalPlacement(self, pos, benchmark, net_data, frame_offset=0):
@@ -966,6 +987,9 @@ class CometPlacer:
             "overflow_ema": float("inf"),
             "stop_reason": "",
             "conv_life": None,
+            "macro_locks": [],
+            "active_lock_mask": None,
+            "scatter_lock_mask": torch.zeros(num_macros, dtype=torch.bool, device=self.device),
         }
 
         # Scatter soft macros uniformly across the canvas as a fresh start.
@@ -1031,6 +1055,7 @@ class CometPlacer:
                 break
 
         self._out.log(f"  [cGP] done  iters={t + 1}  wl={state['prev_wl']:.4f}")
+        self._out.banner(f"Phase 4: cGP  done (iters={t + 1})")
         return state["best_pos"]
 
     def _initState(self, benchmark, net_data):
@@ -1054,11 +1079,17 @@ class CometPlacer:
         self._out.setupFrames(benchmark, net_data)
         self._out.openIterLog(benchmark)
 
-        pos = self._initialPlacement(benchmark, net_data, num_macros,
-                                    canvas_w, canvas_h, half_w, half_h)
+        self._timer.start("mIP")
+        pos, scatter_ids = self._initialPlacement(benchmark, net_data, num_macros,
+                                                   canvas_w, canvas_h, half_w, half_h)
+        self._timer.stop("mIP")
         if self.init_placement == "quadratic":
             self._out.saveMipFrame(pos, benchmark, num_macros)
         init_pos = pos.clone()
+
+        scatter_lock_mask = torch.zeros(num_macros, dtype=torch.bool, device=self.device)
+        if len(scatter_ids) > 0:
+            scatter_lock_mask[scatter_ids] = True
 
         state = {
             "num_macros": num_macros,
@@ -1089,11 +1120,50 @@ class CometPlacer:
             "halo_size": self.halo_size,
             "stop_reason": "",
             "conv_life": None,
+            "macro_locks": [],
+            "active_lock_mask": None,
+            "scatter_lock_mask": scatter_lock_mask,
         }
 
         self._initOptimizer(state, max_step, pos)
         self._logSetup(state)
         return state
+
+    # -------------------------------------------------------------------
+    # Dynamic macro locks
+    # -------------------------------------------------------------------
+
+    def _addMacroLock(self, state, mask, unlock_fn):
+        """Register a dynamic macro lock active until unlock_fn(state) returns True.
+
+        mask      : bool tensor [num_macros] — which macros to hold fixed
+        unlock_fn : callable(state) -> bool  — return True to release the lock
+        """
+        state["macro_locks"].append({"mask": mask, "unlock_fn": unlock_fn})
+
+    def _tickMacroLocks(self, state):
+        """Evaluate all lock conditions once per iteration.
+
+        Removes locks whose unlock_fn returns True (logging each release) and
+        stores the OR of all remaining active masks in state["active_lock_mask"]
+        (None when no locks are active).
+        """
+        still_locked = []
+        for lock in state["macro_locks"]:
+            if lock["unlock_fn"](state):
+                n = int(lock["mask"].sum().item())
+                self._out.log(
+                    f"  [lock] released {n} macro(s)  lambda={state['lambda_d']:.2e}")
+            else:
+                still_locked.append(lock)
+        state["macro_locks"] = still_locked
+        if not still_locked:
+            state["active_lock_mask"] = None
+            return
+        mask = still_locked[0]["mask"].clone()
+        for lock in still_locked[1:]:
+            mask = mask | lock["mask"]
+        state["active_lock_mask"] = mask
 
     def _buildPreconditioner(self, benchmark, net_data, num_macros):
         """Build per-macro preconditioner: macro_area + net_degree."""
@@ -1109,8 +1179,14 @@ class CometPlacer:
 
     def _initialPlacement(self, benchmark, net_data, num_macros,
                           canvas_w, canvas_h, half_w, half_h):
-        """Set initial macro positions (from benchmark, center scatter, or quadratic WL)."""
+        """Set initial macro positions (from benchmark, center scatter, or quadratic WL).
+
+        Returns (pos, scatter_ids) where scatter_ids is a numpy int64 array of
+        macro indices that were scatter-locked during mIP (empty if none).
+        """
+        import numpy as np
         pos = benchmark.macro_positions[:num_macros].clone().float().to(self.device)
+        scatter_ids = np.empty(0, dtype=np.int64)
         if self.init_placement == "center":
             spread_r = self.init_spread ** 0.5
             cx, cy = canvas_w / 2.0, canvas_h / 2.0
@@ -1135,7 +1211,7 @@ class CometPlacer:
             pos = pos.to(self.device)
             self._out.saveScatterIds(scatter_ids)
             self._out.log(f"  mIP done.")
-        return pos
+        return pos, scatter_ids
 
     def _initOptimizer(self, state, max_step, pos):
         """Initialise optimizer-specific state variables."""
@@ -1176,6 +1252,8 @@ class CometPlacer:
 
     def _runOneIteration(self, t, state, benchmark, net_data):
         """Execute one gradient descent iteration. Returns True if should stop."""
+        self._tickMacroLocks(state)
+
         eval_pos = state["v_k"] if self.optimizer == "nesterov" else state["pos"]
 
         wl_grad, wl_val = self._computeWlGradient(eval_pos, net_data, state["gamma"])
@@ -1186,6 +1264,8 @@ class CometPlacer:
 
         with torch.no_grad():
             grad[state["fixed_mask"]] = 0.0
+            if state["active_lock_mask"] is not None:
+                grad[state["active_lock_mask"]] = 0.0
             alpha = self._applyOptimizer(t, grad, state, eval_pos, wl_val)
 
             if torch.isnan(state["pos"]).any():
@@ -1342,6 +1422,8 @@ class CometPlacer:
 
         u_kp1 = state["v_k"].detach() - step_vec
         u_kp1[state["fixed_mask"]] = state["init_pos"][state["fixed_mask"]]
+        if state["active_lock_mask"] is not None:
+            u_kp1[state["active_lock_mask"]] = state["init_pos"][state["active_lock_mask"]]
         u_kp1[:, 0] = u_kp1[:, 0].clamp(
             min=state["half_w"], max=state["canvas_w"] - state["half_w"])
         u_kp1[:, 1] = u_kp1[:, 1].clamp(
@@ -1349,6 +1431,8 @@ class CometPlacer:
 
         v_kp1 = u_kp1 + coef * (u_kp1 - state["u_k"])
         v_kp1[state["fixed_mask"]] = state["init_pos"][state["fixed_mask"]]
+        if state["active_lock_mask"] is not None:
+            v_kp1[state["active_lock_mask"]] = state["init_pos"][state["active_lock_mask"]]
         v_kp1[:, 0] = v_kp1[:, 0].clamp(
             min=state["half_w"], max=state["canvas_w"] - state["half_w"])
         v_kp1[:, 1] = v_kp1[:, 1].clamp(
@@ -1360,12 +1444,14 @@ class CometPlacer:
         state["pos"] = u_kp1
 
     def _clampPositions(self, state):
-        """Clamp positions to canvas bounds and restore fixed macros."""
+        """Clamp positions to canvas bounds and restore fixed/locked macros."""
         state["pos"][:, 0] = state["pos"][:, 0].clamp(
             min=state["half_w"], max=state["canvas_w"] - state["half_w"])
         state["pos"][:, 1] = state["pos"][:, 1].clamp(
             min=state["half_h"], max=state["canvas_h"] - state["half_h"])
         state["pos"][state["fixed_mask"]] = state["init_pos"][state["fixed_mask"]]
+        if state["active_lock_mask"] is not None:
+            state["pos"][state["active_lock_mask"]] = state["init_pos"][state["active_lock_mask"]]
 
     # -------------------------------------------------------------------
     # Lambda schedule
@@ -1402,6 +1488,19 @@ class CometPlacer:
         else:
             state["lambda_d"] = self.density_weight_init
             state["overflow_ema"] = float("inf")
+
+        if (self.scatter_lock_mult > 0
+                and state["scatter_lock_mask"].any()):
+            thresh = self.scatter_lock_mult * state["lambda_d"]
+            n = int(state["scatter_lock_mask"].sum().item())
+            self._out.log(
+                f"  [lock] locking {n} scatter macro(s) until "
+                f"lambda >= {thresh:.2e}  (lambda_0={state['lambda_d']:.2e})")
+            self._addMacroLock(
+                state,
+                state["scatter_lock_mask"],
+                lambda s, t=thresh: s["lambda_d"] >= t,
+            )
 
     def _rampLambda(self, t, wl_val, overflow, state):
         """Ramp lambda using overflow-feedback or geometric schedule.

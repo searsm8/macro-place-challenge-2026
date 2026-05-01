@@ -43,8 +43,16 @@ Usage
 #
 # Leave COMBOS = [] to use plain Cartesian product (original behaviour).
 COMBOS: list[dict] = [
-     {"mgp_enable": "true",  "legalization": "bump"},
-     {"mgp_enable": "false", "legalization": "none"},
+     #{"mgp_enable": "true",  "legalization": "bump"},
+     #{"mgp_enable": "false", "legalization": "none"},
+     {"initial_placement": "none"},
+     {"initial_placement": "center"},
+     {"initial_placement": "quadratic", "quad_scatter_lock_mult": 1e3},
+     {"initial_placement": "quadratic", "quad_scatter_lock_mult": 1e4},
+     {"initial_placement": "quadratic", "quad_scatter_lock_mult": 5e4},
+     {"initial_placement": "quadratic", "quad_scatter_lock_mult": 1e5},
+     {"initial_placement": "quadratic", "quad_scatter_lock_mult": 5e5},
+     {"initial_placement": "quadratic", "quad_scatter_lock_mult": 1e6},
 ]
 
 SWEEP = {
@@ -54,7 +62,6 @@ SWEEP = {
 
     #"lambda_pcof_upper": [1.03, 1.05],
     #"lambda_hm_init": [1, 2, 3, 5, 10, 20], #(4/23) 1 is best (disabled density boost)
-    #"soft_place": ["False", "True"],
     #"soft_place_iters": [1000, 3000, 5000],
     #"lambda_max": [25000],
     #"initial_placement": ["none", "center", "quadratic"],
@@ -65,14 +72,13 @@ SWEEP = {
     #"lambda_iters_per_update": [1, 3, 5],
     #"hard_spread": ["False", "True"],
     #"hard_spread_iters": [0, 50],
-    #"ga_enable": ["False", "True"],
     #"curtailed_iters": [300, 500, 700, 900]
 
     #"stop_overflow": [0.03, 0.04, .05],
     #"rotation_optimizer": ["none", "greedy"],
     #"use_gpu": ["False", "True"],
     #"deterministic": ["False","False","True","True"],
-    #"n_placement_passes": [1, 2],
+    #"n_placement_passes": [1, 2, 3],
     #"rotation_candidates": ["all", "no-swap"],
     #"gamma_decay": [0.991, 0.992, 0.993, 0.994],
     #"gamma": ["auto", "ovfw"],
@@ -84,12 +90,16 @@ SWEEP = {
     #"target_density": [0.65, .70, .75, 0.80],
     #"density_grid_size": [128,256,512,1024],
     #"target_density": [0.65],
-    #"quad_scatter_fraction": [0.05, 0.1, 0.125, 0.15], # fraction of movable macros (ranked by area×net_degree) randomly scattered in stage 1 (0 = disabled)
-    #"halo_size": [ 0.3, 0.4, 0.5, 0.6],
+    #"quad_scatter_fraction": [0, 0.1], # fraction of movable macros (ranked by area×net_degree) randomly scattered in stage 1 (0 = disabled)
+    #"halo_size": [ 0.2, 0.25, 0.3, 0.35],
+    #"soft_place": ["False", "True"],
     #"halo_size": [ 0.3],
     #"halo_legalize": [0.1, 0.15],
-    "seed": [0, 1, 2, 3], # random seed for initial placement and mGP; affects all stochasticity when deterministic=false
+    #"seed": [1, 2, 3, 4, 9, 14, 10, 7], # random seed for initial placement and mGP; affects all stochasticity when deterministic=false
+    #"quad_scatter_lock_mult": [5, 10, 20, 50], # keep scatter macros fixed in mGP until lambda >= this × lambda_0
     #"mip_only": ["False", "True"], # skip mGP/cGP — legalize from mIP positions and return immediately (fast proxy for scatter quality)
+
+    #"quad_scatter_lock_mult": [1e3, 1e4, 1e5, 1e6], # keep scatter macros fixed in mGP until lambda >= this × lambda_0
 }
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -116,11 +126,11 @@ MASTER_CSV  = SWEEP_DIR / "results.csv"
 UV          = "/home/msears/.local/bin/uv"
 
 IBM_BENCHMARKS = [
-    #"ibm01", "ibm02", "ibm03", "ibm04", "ibm06", "ibm07", "ibm08", "ibm09",
-    #"ibm10", "ibm11", "ibm12", "ibm13", "ibm14", "ibm15", "ibm16", "ibm17", "ibm18",
+    "ibm01", "ibm02", "ibm03", "ibm04", "ibm06", "ibm07", "ibm08", "ibm09",
+    "ibm10", "ibm11", "ibm12", "ibm13", "ibm14", "ibm15", "ibm16", "ibm17", "ibm18",
 
     # small+medium+large subset for quick testing
-    "ibm01", "ibm04", "ibm14", # best avg for this subset: 1.3782
+    #"ibm01", "ibm04", "ibm14", # best avg for this subset: 1.3782
 ]
 
 METRIC_COLS = ["proxy", "wl", "den", "cong", "valid", "time_s", "mgp_iters", "cgp_iters", "overlaps"]

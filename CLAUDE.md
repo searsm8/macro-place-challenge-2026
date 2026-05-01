@@ -44,8 +44,9 @@ wsl -e bash -c "cd /home/msears/phd/macro-place-challenge-2026 && /home/msears/.
 |------|---------|
 | `submissions/msears/placer.py` | Main placer — CometPlacer class |
 | `submissions/msears/density.py` | Density spreading forces (bell + electrostatic) |
-| `submissions/msears/legalizer.py` | Spiral push-out legalization (spiralLegalize) |
-| `submissions/msears/output.py` | OutputManager: logging, frame recording |
+| `submissions/msears/legalizer.py` | Macro legalization (bump + spiral); vectorized |
+| `submissions/msears/output.py` | OutputManager: logging, frame recording, banners |
+| `submissions/msears/quadratic_placer.py` | Quadratic WL solver (mIP); `select_scatter_ids` |
 | `submissions/msears/config.toml` | Hyperparameter config (TOML, auto-discovered) |
 | `scripts/frames_to_gif.py` | Offline GIF renderer from saved frame snapshots |
 
@@ -59,8 +60,10 @@ wsl -e bash -c "cd /home/msears/phd/macro-place-challenge-2026 && /home/msears/.
   - `is_macro [P]` — bool mask distinguishing macro pins from port pins
 - **`_wa_hpwl(pos, net_data, gamma)`** — vectorized smooth WA HPWL via scatter_add
 - **`_density.compute_density_gradient(method, pos, benchmark, target_density)`** — density spreading force dispatcher (from `density.py`)
-- **`CometPlacer.place(benchmark)`** — main entry point called by contest harness
-- **`CometPlacer._gradient_place(benchmark, net_data)`** — gradient descent loop; calls `spiralLegalize` post-loop when `legalization = "spiral"` in config, then saves `frame_legal.pt` via `OutputManager.saveLegalFrame()`
+- **`PhaseTimer`** — stopwatch that wraps each placement phase; prints a timing table at end of each run
+- **`CometPlacer.place(benchmark)`** — main entry point; calls `compute_proxy_cost` at end and saves `proxy_score.pt` via `OutputManager.saveProxyScore()`
+- **`CometPlacer._runPlacementPipeline`** — orchestrates mGP → rotation → mLG → cGP; emits phase banners via `OutputManager.banner()`
+- **`CometPlacer._gradient_place(benchmark, net_data)`** — gradient descent loop; calls `bumpLegalize`/`spiralLegalize` post-loop, saves `frame_legal.pt` via `OutputManager.saveLegalFrame()`
 
 ### Algorithm (current state)
 WA HPWL + electrostatic density gradient descent, inspired by DREAMplace (Lin et al.
@@ -139,8 +142,10 @@ When `record_frames = true` in config.toml, each iteration saves:
 
 GIF renderer (`scripts/frames_to_gif.py`) draws:
 - Hard macros: steelblue, soft macros: mediumseagreen, fixed: red
-- Net lines: black, alpha=0.05, star topology (driver → each sink)
-- CLI flags: `--benchmark`, `--fps`, `--step`, `--dpi`, `--net-alpha`, `--no-nets`
+- Net lines: three layers — plain (black), IO-port nets (orange), highlighted macro nets (crimson)
+- Proxy score overlay on final/legalized frame (bottom-left): proxy, WL, density, congestion, overlaps
+- CLI flags: `--benchmark`, `--fps`, `--step`, `--dpi`, `--net-alpha`, `--no-nets`, `--highlight-io N`
+- Config: `highlight_io_nets = N` highlights up to N nets connected to fixed I/O ports (0 = all)
 
 ## Benchmarks
 
@@ -226,6 +231,19 @@ Avoids external DCT libraries. Spectral constants cached per grid shape.
 **Key bug fixed:** original `_idxst_2N` used `expkp1 = 2*exp(+iπ(k+1)/(2N))` which produced a cosine output (always positive) instead of a sine (antisymmetric). This caused all macros to collapse to a corner. The fix: use `complex(expk[:,1], -expk[:,0])` (no separate expkp1 needed).
 
 **Sign convention:** the potential φ has a maximum at density peaks (∇²φ=ρ with Neumann BCs). The repulsive spreading gradient is `den_grad = -E = +∇φ`, so `_density_gradient_electrostatic` returns `(-Ex, -Ey)` from the Poisson solver.
+
+## Shelved / other branches
+
+### `genetic_init` branch
+GA for joint scatter-macro position + orientation search. Each chromosome encodes
+orientations (scatter macros only) + initial (x, y) positions. Fitness = WL after
+a full placement with scatter macros pinned at chromosome positions. Shelved because
+the non-GA pipeline (greedy rotation + mLG) reaches ~0.99 proxy on ibm01 with 0
+overlaps; GA adds significant runtime complexity for uncertain gain.
+
+Key files on that branch:
+- `submissions/msears/genetic.py` — `Chromosome`, `GeneticPlacer`, `PlacementEvalFn`
+- `placer.py` — `_runGa`, `_buildFullEvalConfig`
 
 ### NOT yet implemented
 - Nesterov momentum + BB step size

@@ -41,21 +41,24 @@ from PIL import Image
 def _load_visualizer_config():
     """
     Read highlight settings from submissions/msears/config.toml.
-    Returns (highlight_macros: list[str], highlight_random_macros: int, highlight_scatter_macros: int).
-    Falls back to ([], 0, 0) if the key / file is absent.
+    Returns (highlight_macros, highlight_random_macros, highlight_scatter_macros, highlight_io_nets).
+    Falls back to ([], 0, 0, None) if the key / file is absent.
     """
     import tomllib
     repo_root = Path(__file__).resolve().parent.parent
     cfg_path = repo_root / "submissions" / "msears" / "config.toml"
     if not cfg_path.exists():
-        return [], 0, 0
+        return [], 0, 0, None
     with open(cfg_path, "rb") as f:
         cfg = tomllib.load(f)
     out = cfg.get("output", {})
     names     = list(out.get("highlight_macros", []))
     n_rand    = int(out.get("highlight_random_macros", 0))
     n_scatter = int(out.get("highlight_scatter_macros", 0))
-    return names, n_rand, n_scatter
+    n_io      = out.get("highlight_io_nets", None)
+    if n_io is not None:
+        n_io = int(n_io)
+    return names, n_rand, n_scatter, n_io
 
 
 def _sample_highlight_ids(benchmark, n):
@@ -94,6 +97,25 @@ def resolve_highlight_ids(benchmark, named_macros=(), n_random=0):
     if not highlight_ids and n_random > 0:
         highlight_ids = _sample_highlight_ids(benchmark, n_random)
     return highlight_ids
+
+
+def _io_net_ids(net_edges, max_count=None):
+    """
+    Return a set of net indices that contain at least one I/O port pin
+    (macro_ids == -1).  If max_count is 0 or None, return all such nets;
+    otherwise return at most max_count, ordered by net index.
+    """
+    if net_edges is None:
+        return set()
+    macro_ids = net_edges["macro_ids"]   # [P], -1 = port
+    net_ids_t = net_edges["net_ids"]     # [P]
+    port_mask = (macro_ids < 0)
+    if not port_mask.any():
+        return set()
+    port_nets = torch.unique(net_ids_t[port_mask]).tolist()
+    if max_count and max_count > 0:
+        port_nets = port_nets[:max_count]
+    return set(int(n) for n in port_nets)
 
 
 def _annotate_macros_dat(dat_path, highlight_names):
@@ -147,6 +169,9 @@ def parse_args():
                    help="Only render the legalized frame as a PNG (skip GIF)")
     p.add_argument("--mip-only", action="store_true", default=False,
                    help="Only render the quadratic-init (mIP) frame as a PNG (skip GIF)")
+    p.add_argument("--highlight-io", type=int, default=None, metavar="N",
+                   help="Highlight up to N nets that connect to fixed I/O ports "
+                        "(0 = all IO nets). Default: read highlight_io_nets from config.toml.")
     return p.parse_args()
 
 
@@ -241,7 +266,8 @@ def load_benchmark_for_frames(benchmark_name):
 
 
 def render_frame(frame_data, benchmark, net_edges, net_alpha, save_path, dpi,
-                 highlight_ids=None, label_override=None):
+                 highlight_ids=None, label_override=None,
+                 proxy_score=None, io_net_ids=None, bottom_left_text=None):
     """
     Render a single frame to a PNG using a custom single-panel matplotlib figure.
 
@@ -301,34 +327,39 @@ def render_frame(frame_data, benchmark, net_edges, net_alpha, save_path, dpi,
             axis=1,
         )  # [S, 2, 2]
 
+        nf_net_ids = net_ids_t[non_first]
+
+        # Build per-edge boolean masks for macro-highlight and IO-highlight
+        edge_macro_hi = np.zeros(segs.shape[0], dtype=bool)
+        edge_io_hi    = np.zeros(segs.shape[0], dtype=bool)
+
         if highlight_ids:
-            # A net is "highlighted" if any of its pins belongs to a highlighted macro.
             pin_highlighted = torch.zeros(len(macro_ids), dtype=torch.bool)
             for hid in highlight_ids:
                 pin_highlighted |= (macro_ids == hid)
-            # Per-net flag: True if any pin in that net is highlighted
-            net_highlighted = torch.zeros(net_edges["num_nets"], dtype=torch.float32)
-            net_highlighted.scatter_reduce_(
-                0, net_ids_t, pin_highlighted.float(),
-                reduce="amax", include_self=True,
-            )
-            net_highlighted = net_highlighted.bool()
-            # Map back to the non-first (edge) pins
-            nf_net_ids = net_ids_t[non_first]
-            edge_hi = net_highlighted[nf_net_ids].numpy()
+            net_hi_t = torch.zeros(net_edges["num_nets"], dtype=torch.float32)
+            net_hi_t.scatter_reduce_(0, net_ids_t, pin_highlighted.float(),
+                                     reduce="amax", include_self=True)
+            edge_macro_hi = net_hi_t.bool()[nf_net_ids].numpy()
 
+        if io_net_ids is not None:
+            io_mask = torch.zeros(net_edges["num_nets"], dtype=torch.bool)
+            io_mask[list(io_net_ids)] = True
+            edge_io_hi = io_mask[nf_net_ids].numpy()
+
+        plain = ~edge_macro_hi & ~edge_io_hi
+        ax.add_collection(LineCollection(
+            segs[plain], colors="black", alpha=net_alpha, linewidths=0.3, zorder=1,
+        ))
+        if edge_io_hi.any():
             ax.add_collection(LineCollection(
-                segs[~edge_hi], colors="black", alpha=net_alpha,
-                linewidths=0.3, zorder=1,
+                segs[edge_io_hi], colors="darkorange", alpha=0.6,
+                linewidths=0.5, zorder=2,
             ))
-            if edge_hi.any():
-                ax.add_collection(LineCollection(
-                    segs[edge_hi], colors="crimson", alpha=0.95,
-                    linewidths=0.8, zorder=2,
-                ))
-        else:
+        if edge_macro_hi.any():
             ax.add_collection(LineCollection(
-                segs, colors="black", alpha=net_alpha, linewidths=0.3, zorder=1,
+                segs[edge_macro_hi], colors="crimson", alpha=0.95,
+                linewidths=0.8, zorder=3,
             ))
 
     # ── Macro rectangles ──────────────────────────────────────────────────
@@ -414,10 +445,36 @@ def render_frame(frame_data, benchmark, net_edges, net_alpha, save_path, dpi,
         phase_text = ""
     if phase_text:
         ax.text(
-            0.5, -0.02, phase_text,
+            0.98, -0.02, phase_text,
             transform=ax.transAxes,
-            ha="center", va="top",
+            ha="right", va="top",
             fontsize=10, fontweight="bold",
+        )
+
+    # ── Proxy score overlay (same level as phase label, left-aligned) ────
+    if proxy_score is not None:
+        p   = proxy_score["proxy_cost"]
+        wl  = proxy_score["wirelength_cost"]
+        dn  = proxy_score["density_cost"]
+        cg  = proxy_score["congestion_cost"]
+        ov  = proxy_score["overlap_count"]
+        validity = "VALID" if ov == 0 else f"INVALID ({ov} overlaps)"
+        label = (f"proxy={p:.4f}  {validity}"
+                 f"  |  wl={wl:.4f}  den={dn:.4f}  cong={cg:.4f}")
+        ax.text(
+            0.02, -0.02, label,
+            transform=ax.transAxes,
+            ha="left", va="top",
+            fontsize=7.5,
+            family="monospace",
+        )
+    elif bottom_left_text is not None:
+        ax.text(
+            0.02, -0.02, bottom_left_text,
+            transform=ax.transAxes,
+            ha="left", va="top",
+            fontsize=8,
+            family="monospace",
         )
 
     plt.tight_layout()
@@ -462,7 +519,7 @@ def main():
 
     # Resolve highlight macro names → indices.
     # Priority: --highlight CLI > highlight_macros config > scatter > random sampling.
-    cfg_names, cfg_n_random, cfg_n_scatter = _load_visualizer_config()
+    cfg_names, cfg_n_random, cfg_n_scatter, cfg_n_io = _load_visualizer_config()
     name_to_idx = {name: i for i, name in enumerate(benchmark.macro_names)}
 
     highlight_ids = set()
@@ -504,6 +561,24 @@ def main():
             _annotate_macros_dat(macros_dat, highlight_names)
             print(f"  macros.dat: annotated with '*' for highlighted macros")
 
+    # -- Load proxy score (written by placer when record_frames=true) ---------
+    proxy_score = None
+    proxy_pt = frames_root / "proxy_score.pt"
+    if proxy_pt.exists():
+        proxy_score = torch.load(proxy_pt, weights_only=False)
+        print(f"  Proxy score : {proxy_score['proxy_cost']:.4f}  "
+              f"(wl={proxy_score['wirelength_cost']:.4f}  "
+              f"den={proxy_score['density_cost']:.4f}  "
+              f"cong={proxy_score['congestion_cost']:.4f}  "
+              f"overlaps={proxy_score['overlap_count']})")
+
+    # -- Resolve I/O net IDs --------------------------------------------------
+    n_io = args.highlight_io if args.highlight_io is not None else cfg_n_io
+    io_nets = None
+    if n_io is not None and net_edges is not None:
+        io_nets = _io_net_ids(net_edges, max_count=n_io)
+        print(f"  IO nets   : {len(io_nets)} highlighted  (limit={n_io or 'all'})")
+
     # --mip-only: render just the mIP (quadratic-init) PNG and exit
     if args.mip_only:
         if not mip_frame_path.exists():
@@ -518,7 +593,8 @@ def main():
         render_frame(frame_data, benchmark, net_edges, args.net_alpha,
                      str(mip_png_path), dpi=150,
                      highlight_ids=highlight_ids or None,
-                     label_override="mIP (quadratic init)")
+                     label_override="mIP (quadratic init)",
+                     io_net_ids=io_nets)
         print(f"  Saved mIP image: {mip_png_path}")
         return
 
@@ -533,7 +609,9 @@ def main():
         frame_data = torch.load(legal_frame_path, weights_only=False)
         render_frame(frame_data, benchmark, net_edges, args.net_alpha,
                      str(legal_png_path), dpi=150,
-                     highlight_ids=highlight_ids or None)
+                     highlight_ids=highlight_ids or None,
+                     proxy_score=proxy_score,
+                     io_net_ids=io_nets)
         print(f"  Saved legalized image: {legal_png_path}")
         return
 
@@ -564,9 +642,13 @@ def main():
     with tempfile.TemporaryDirectory() as tmpdir:
         for i, (frame_data, dur) in enumerate(ordered):
             png_path = Path(tmpdir) / f"frame_{i:05d}.png"
+            # Show proxy score only on the final frame
+            frame_proxy = proxy_score if (i == n_frames - 1) else None
             render_frame(frame_data, benchmark, net_edges, args.net_alpha,
                          str(png_path), args.dpi,
-                         highlight_ids=highlight_ids or None)
+                         highlight_ids=highlight_ids or None,
+                         proxy_score=frame_proxy,
+                         io_net_ids=io_nets)
             pil_frames.append(Image.open(png_path).copy())
             frame_durations.append(dur)
 
@@ -583,7 +665,9 @@ def main():
             render_frame(torch.load(legal_frame_path, weights_only=False),
                          benchmark, net_edges, args.net_alpha,
                          str(legal_png_path), dpi=150,
-                         highlight_ids=highlight_ids or None)
+                         highlight_ids=highlight_ids or None,
+                         proxy_score=proxy_score,
+                         io_net_ids=io_nets)
             print(f"\n  Saved legalized image: {legal_png_path}")
 
     print()  # newline after progress bar

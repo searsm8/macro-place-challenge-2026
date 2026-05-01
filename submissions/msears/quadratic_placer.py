@@ -39,6 +39,32 @@ import scipy.sparse.linalg
 import torch
 
 
+def select_scatter_ids(benchmark, scatter_fraction):
+    """
+    Return global hard-macro indices for scatter selection: the largest hard
+    movable macros whose cumulative area >= scatter_fraction * total
+    hard-movable area.  Returns an empty int64 array if fraction is 0 or
+    there are too few candidates (≤1 hard movable).
+    """
+    if scatter_fraction <= 0:
+        return np.empty(0, dtype=np.int64)
+    num_macros = benchmark.num_macros
+    half_w = benchmark.macro_sizes[:num_macros, 0].numpy() / 2
+    half_h = benchmark.macro_sizes[:num_macros, 1].numpy() / 2
+    fixed_mask = benchmark.macro_fixed[:num_macros].numpy()
+    movable_ids = np.where(~fixed_mask)[0]
+    hard_movable = movable_ids[movable_ids < benchmark.num_hard_macros]
+    if len(hard_movable) <= 1:
+        return np.empty(0, dtype=np.int64)
+    areas = (half_w * half_h)[hard_movable]
+    ranked = np.argsort(areas)[::-1]
+    cutoff = np.searchsorted(
+        np.cumsum(areas[ranked]), scatter_fraction * areas.sum(), side="left"
+    )
+    n_scatter = min(int(cutoff) + 1, len(hard_movable) - 1)
+    return hard_movable[ranked[:n_scatter]]
+
+
 def quadratic_init(net_data, benchmark, cfg):
     """
     Quadratic WL minimizer for initial placement (mIP).

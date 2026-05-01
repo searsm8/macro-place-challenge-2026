@@ -15,56 +15,49 @@ import torch
 
 
 # ---------------------------------------------------------------------------
-# Geometry helpers
+# Vectorized geometry helpers
 # ---------------------------------------------------------------------------
 
-def _hasOverlap(cx_a, cy_a, w_a, h_a, cx_b, cy_b, w_b, h_b):
-    """Return True if two axis-aligned rectangles strictly overlap."""
-    return (abs(cx_a - cx_b) < (w_a + w_b) / 2.0 and
-            abs(cy_a - cy_b) < (h_a + h_b) / 2.0)
+def _countOverlaps(pos, num_hard, sizes):
+    """Count overlapping hard macro pairs."""
+    cx = pos[:num_hard, 0]
+    cy = pos[:num_hard, 1]
+    w  = sizes[:num_hard, 0]
+    h  = sizes[:num_hard, 1]
+    dx = (cx.unsqueeze(1) - cx.unsqueeze(0)).abs()
+    dy = (cy.unsqueeze(1) - cy.unsqueeze(0)).abs()
+    ov = ((w.unsqueeze(1) + w.unsqueeze(0)) * 0.5 - dx > 0) & \
+         ((h.unsqueeze(1) + h.unsqueeze(0)) * 0.5 - dy > 0)
+    upper = torch.triu(torch.ones(num_hard, num_hard, dtype=torch.bool), diagonal=1)
+    return int((ov & upper).sum())
+
+
+def _findOverlappingPairs(pos, num_hard, sizes):
+    """
+    Return a list of (severity, i, j) for every overlapping pair.
+    severity = min(ov_x, ov_y) — penetration depth along the easier-to-clear axis.
+    """
+    cx = pos[:num_hard, 0]
+    cy = pos[:num_hard, 1]
+    w  = sizes[:num_hard, 0]
+    h  = sizes[:num_hard, 1]
+    dx = (cx.unsqueeze(1) - cx.unsqueeze(0)).abs()
+    dy = (cy.unsqueeze(1) - cy.unsqueeze(0)).abs()
+    ov_x = (w.unsqueeze(1) + w.unsqueeze(0)) * 0.5 - dx
+    ov_y = (h.unsqueeze(1) + h.unsqueeze(0)) * 0.5 - dy
+    upper = torch.triu(torch.ones(num_hard, num_hard, dtype=torch.bool), diagonal=1)
+    mask = (ov_x > 0) & (ov_y > 0) & upper
+    i_idx, j_idx = mask.nonzero(as_tuple=True)
+    if i_idx.numel() == 0:
+        return []
+    sev = torch.minimum(ov_x[i_idx, j_idx], ov_y[i_idx, j_idx])
+    return list(zip(sev.tolist(), i_idx.tolist(), j_idx.tolist()))
 
 
 def _fitsCanvas(cx, cy, w, h, canvas_w, canvas_h):
     """Return True if the macro fits entirely within the canvas."""
     return (cx - w / 2.0 >= 0.0 and cx + w / 2.0 <= canvas_w and
             cy - h / 2.0 >= 0.0 and cy + h / 2.0 <= canvas_h)
-
-
-def _countOverlaps(pos, num_hard, sizes):
-    """Count overlapping hard macro pairs."""
-    count = 0
-    for i in range(num_hard):
-        cxi, cyi = float(pos[i, 0]), float(pos[i, 1])
-        wi, hi = float(sizes[i, 0]), float(sizes[i, 1])
-        for j in range(i + 1, num_hard):
-            if _hasOverlap(cxi, cyi, wi, hi,
-                           float(pos[j, 0]), float(pos[j, 1]),
-                           float(sizes[j, 0]), float(sizes[j, 1])):
-                count += 1
-    return count
-
-
-def _findOverlappingPairs(pos, num_hard, sizes):
-    """
-    Return a list of (severity, i, j) for every overlapping hard-macro pair.
-    severity = min(ov_x, ov_y) — penetration depth along the easier-to-clear axis.
-    """
-    pairs = []
-    for i in range(num_hard):
-        cxi = float(pos[i, 0])
-        cyi = float(pos[i, 1])
-        wi  = float(sizes[i, 0])
-        hi  = float(sizes[i, 1])
-        for j in range(i + 1, num_hard):
-            cxj = float(pos[j, 0])
-            cyj = float(pos[j, 1])
-            wj  = float(sizes[j, 0])
-            hj  = float(sizes[j, 1])
-            ov_x = (wi + wj) / 2.0 - abs(cxi - cxj)
-            ov_y = (hi + hj) / 2.0 - abs(cyi - cyj)
-            if ov_x > 0.0 and ov_y > 0.0:
-                pairs.append((min(ov_x, ov_y), i, j))
-    return pairs
 
 
 # ---------------------------------------------------------------------------
@@ -74,12 +67,12 @@ def _findOverlappingPairs(pos, num_hard, sizes):
 def _jacobiPass(pos, num_hard, phys_sizes, eff_sizes, fixed,
                 canvas_w, canvas_h, margin, damping):
     """
-    One Jacobi bump pass.
+    One vectorized Jacobi bump pass.
 
     Reads all positions once at the start of this pass, computes the
     minimum-translation-vector (MTV) push for every overlapping pair,
-    accumulates net displacements per macro, then applies them all
-    simultaneously with a damping factor.
+    accumulates net displacements per macro via scatter_add, then applies
+    them all simultaneously with a damping factor.
 
     phys_sizes : physical macro dimensions — used for canvas clamping and
                  area-weighted split (actual mass matters for priority).
@@ -89,86 +82,80 @@ def _jacobiPass(pos, num_hard, phys_sizes, eff_sizes, fixed,
 
     Returns (num_overlapping_pairs, num_unresolvable).
     """
-    delta_x = [0.0] * num_hard
-    delta_y = [0.0] * num_hard
-    count = 0
-    unresolvable = 0
+    n = num_hard
+    cx = pos[:n, 0]
+    cy = pos[:n, 1]
+    ew = eff_sizes[:n, 0]
+    eh = eff_sizes[:n, 1]
+    pw = phys_sizes[:n, 0]
+    ph = phys_sizes[:n, 1]
 
-    for i in range(num_hard):
-        cx_i = float(pos[i, 0])
-        cy_i = float(pos[i, 1])
-        wei = float(eff_sizes[i, 0])   # effective width  (halo-inflated)
-        hei = float(eff_sizes[i, 1])   # effective height (halo-inflated)
-        fi = bool(fixed[i])
+    # Pairwise displacement vectors: dx[i,j] = cx[i] - cx[j]  (i pushed away from j)
+    dx = cx.unsqueeze(1) - cx.unsqueeze(0)   # [n, n]
+    dy = cy.unsqueeze(1) - cy.unsqueeze(0)
 
-        for j in range(i + 1, num_hard):
-            cx_j = float(pos[j, 0])
-            cy_j = float(pos[j, 1])
-            wej = float(eff_sizes[j, 0])
-            hej = float(eff_sizes[j, 1])
+    # Overlap on each axis for every pair
+    ov_x = (ew.unsqueeze(1) + ew.unsqueeze(0)) * 0.5 - dx.abs()   # [n, n]
+    ov_y = (eh.unsqueeze(1) + eh.unsqueeze(0)) * 0.5 - dy.abs()
 
-            ov_x = (wei + wej) / 2.0 - abs(cx_i - cx_j)
-            ov_y = (hei + hej) / 2.0 - abs(cy_i - cy_j)
+    # Upper-triangle overlapping pairs only
+    upper = torch.triu(torch.ones(n, n, dtype=torch.bool), diagonal=1)
+    mask = (ov_x > 0) & (ov_y > 0) & upper
+    i_idx, j_idx = mask.nonzero(as_tuple=True)
+    count = i_idx.numel()
+    if count == 0:
+        return 0, 0
 
-            if ov_x <= 0.0 or ov_y <= 0.0:
-                continue
+    ov_x_p = ov_x[i_idx, j_idx]
+    ov_y_p = ov_y[i_idx, j_idx]
+    dxp = dx[i_idx, j_idx]
+    dyp = dy[i_idx, j_idx]
 
-            count += 1
-            fj = bool(fixed[j])
+    # Handle coincident macros: break tie toward +x
+    coincident = (dxp == 0) & (dyp == 0)
+    dxp = torch.where(coincident, torch.ones_like(dxp), dxp)
 
-            if fi and fj:
-                unresolvable += 1
-                continue
+    sign_x = torch.where(dxp >= 0, torch.ones_like(dxp), -torch.ones_like(dxp))
+    sign_y = torch.where(dyp >= 0, torch.ones_like(dyp), -torch.ones_like(dyp))
 
-            # Direction: push i away from j
-            dx = cx_i - cx_j
-            dy = cy_i - cy_j
-            if dx == 0.0 and dy == 0.0:
-                dx = 1.0  # coincident: break tie toward +x
+    # Minimum-overlap axis push
+    push_x_axis = ov_x_p <= ov_y_p
+    push_x = torch.where(push_x_axis, sign_x * (ov_x_p + margin), torch.zeros_like(ov_x_p))
+    push_y = torch.where(~push_x_axis, sign_y * (ov_y_p + margin), torch.zeros_like(ov_y_p))
 
-            sign_x = 1.0 if dx >= 0.0 else -1.0
-            sign_y = 1.0 if dy >= 0.0 else -1.0
+    # Area-weighted split using physical sizes as proxy for mass
+    ai = pw[i_idx] * ph[i_idx]
+    aj = pw[j_idx] * ph[j_idx]
+    total_a = ai + aj
+    fi = fixed[i_idx].bool()
+    fj = fixed[j_idx].bool()
+    both_fixed = fi & fj
 
-            # Minimum translation vector: push along the axis with smaller overlap
-            if ov_x <= ov_y:
-                push_x = sign_x * (ov_x + margin)
-                push_y = 0.0
-            else:
-                push_x = 0.0
-                push_y = sign_y * (ov_y + margin)
+    frac_i = torch.where(fi,  torch.zeros_like(ai),
+              torch.where(fj,  torch.ones_like(ai),  aj / total_a))
+    frac_j = torch.where(fj,  torch.zeros_like(aj),
+              torch.where(fi,  torch.ones_like(aj),  ai / total_a))
 
-            # Area-weighted split using physical sizes (actual mass, not inflated)
-            ai = float(phys_sizes[i, 0]) * float(phys_sizes[i, 1])
-            aj = float(phys_sizes[j, 0]) * float(phys_sizes[j, 1])
-            total_area = ai + aj
+    # Accumulate displacements with scatter_add
+    delta_x = torch.zeros(n, dtype=pos.dtype)
+    delta_y = torch.zeros(n, dtype=pos.dtype)
+    delta_x.scatter_add_(0, i_idx, push_x * frac_i)
+    delta_y.scatter_add_(0, i_idx, push_y * frac_i)
+    delta_x.scatter_add_(0, j_idx, -push_x * frac_j)
+    delta_y.scatter_add_(0, j_idx, -push_y * frac_j)
 
-            if not fi and not fj:
-                frac_i = aj / total_area
-                frac_j = ai / total_area
-            elif not fi:
-                frac_i, frac_j = 1.0, 0.0
-            else:
-                frac_i, frac_j = 0.0, 1.0
+    # Apply with damping; clamp to canvas using per-macro physical bounds
+    not_fixed = ~fixed[:n].bool()
+    pw_half = pw * 0.5
+    ph_half = ph * 0.5
+    new_x = pos[:n, 0] + damping * delta_x
+    new_y = pos[:n, 1] + damping * delta_y
+    new_x = torch.maximum(pw_half, torch.minimum(canvas_w - pw_half, new_x))
+    new_y = torch.maximum(ph_half, torch.minimum(canvas_h - ph_half, new_y))
+    pos[:n, 0] = torch.where(not_fixed, new_x, pos[:n, 0])
+    pos[:n, 1] = torch.where(not_fixed, new_y, pos[:n, 1])
 
-            delta_x[i] += push_x * frac_i
-            delta_y[i] += push_y * frac_i
-            delta_x[j] -= push_x * frac_j
-            delta_y[j] -= push_y * frac_j
-
-    # Apply net displacements simultaneously — clamp to physical canvas bounds
-    for i in range(num_hard):
-        if bool(fixed[i]):
-            continue
-        if delta_x[i] == 0.0 and delta_y[i] == 0.0:
-            continue
-        wpi = float(phys_sizes[i, 0])
-        hpi = float(phys_sizes[i, 1])
-        new_x = float(pos[i, 0]) + damping * delta_x[i]
-        new_y = float(pos[i, 1]) + damping * delta_y[i]
-        pos[i, 0] = max(wpi / 2.0, min(canvas_w - wpi / 2.0, new_x))
-        pos[i, 1] = max(hpi / 2.0, min(canvas_h - hpi / 2.0, new_y))
-
-    return count, unresolvable
+    return count, int(both_fixed.sum())
 
 
 def _gaussSeidelCleanup(pos, num_hard, phys_sizes, eff_sizes, fixed,
@@ -178,28 +165,27 @@ def _gaussSeidelCleanup(pos, num_hard, phys_sizes, eff_sizes, fixed,
 
     Uses eff_sizes for overlap detection and phys_sizes for clamping/area,
     consistent with _jacobiPass.  Returns the number of physically overlapping
-    pairs remaining (using phys_sizes, not eff_sizes, so the caller can decide
-    whether a spiral fallback is needed for contest legality).
+    pairs remaining (using phys_sizes, not eff_sizes).
     """
-    for _ in range(1, max_cleanup_passes + 1):
+    pw = phys_sizes[:num_hard, 0]
+    ph = phys_sizes[:num_hard, 1]
+    ew = eff_sizes[:num_hard, 0]
+    eh = eff_sizes[:num_hard, 1]
+
+    for _ in range(max_cleanup_passes):
         pairs = _findOverlappingPairs(pos, num_hard, eff_sizes)
         if not pairs:
             break
-
         pairs.sort(reverse=True)   # deepest halo-overlap first
 
         for _, i, j in pairs:
             cx_i = float(pos[i, 0])
             cy_i = float(pos[i, 1])
-            wei  = float(eff_sizes[i, 0])
-            hei  = float(eff_sizes[i, 1])
             cx_j = float(pos[j, 0])
             cy_j = float(pos[j, 1])
-            wej  = float(eff_sizes[j, 0])
-            hej  = float(eff_sizes[j, 1])
 
-            ov_x = (wei + wej) / 2.0 - abs(cx_i - cx_j)
-            ov_y = (hei + hej) / 2.0 - abs(cy_i - cy_j)
+            ov_x = float(ew[i] + ew[j]) * 0.5 - abs(cx_i - cx_j)
+            ov_y = float(eh[i] + eh[j]) * 0.5 - abs(cy_i - cy_j)
             if ov_x <= 0.0 or ov_y <= 0.0:
                 continue
 
@@ -223,39 +209,34 @@ def _gaussSeidelCleanup(pos, num_hard, phys_sizes, eff_sizes, fixed,
                 push_x = 0.0
                 push_y = sign_y * (ov_y + margin)
 
-            ai = float(phys_sizes[i, 0]) * float(phys_sizes[i, 1])
-            aj = float(phys_sizes[j, 0]) * float(phys_sizes[j, 1])
-            total_area = ai + aj
+            ai = float(pw[i]) * float(ph[i])
+            aj = float(pw[j]) * float(ph[j])
+            total_a = ai + aj
 
             if not fi and not fj:
-                frac_i = aj / total_area
-                frac_j = ai / total_area
+                frac_i = aj / total_a
+                frac_j = ai / total_a
             elif not fi:
                 frac_i, frac_j = 1.0, 0.0
             else:
                 frac_i, frac_j = 0.0, 1.0
 
-            wpi = float(phys_sizes[i, 0])
-            hpi = float(phys_sizes[i, 1])
-            new_xi = max(wpi / 2.0, min(canvas_w - wpi / 2.0, cx_i + push_x * frac_i))
-            new_yi = max(hpi / 2.0, min(canvas_h - hpi / 2.0, cy_i + push_y * frac_i))
-            pos[i, 0] = new_xi
-            pos[i, 1] = new_yi
+            wpi_h = float(pw[i]) * 0.5
+            hpi_h = float(ph[i]) * 0.5
+            pos[i, 0] = max(wpi_h, min(canvas_w - wpi_h, cx_i + push_x * frac_i))
+            pos[i, 1] = max(hpi_h, min(canvas_h - hpi_h, cy_i + push_y * frac_i))
 
-            wpj = float(phys_sizes[j, 0])
-            hpj = float(phys_sizes[j, 1])
-            new_xj = max(wpj / 2.0, min(canvas_w - wpj / 2.0, cx_j - push_x * frac_j))
-            new_yj = max(hpj / 2.0, min(canvas_h - hpj / 2.0, cy_j - push_y * frac_j))
-            pos[j, 0] = new_xj
-            pos[j, 1] = new_yj
+            wpj_h = float(pw[j]) * 0.5
+            hpj_h = float(ph[j]) * 0.5
+            pos[j, 0] = max(wpj_h, min(canvas_w - wpj_h, cx_j - push_x * frac_j))
+            pos[j, 1] = max(hpj_h, min(canvas_h - hpj_h, cy_j - push_y * frac_j))
 
-    # Return physical overlap count — spiral fallback only needed for true collisions
     return _countOverlaps(pos, num_hard, phys_sizes)
 
 
 def bumpLegalize(pos, benchmark, halo_size=0.0, max_passes=80, margin_frac=5e-3,
                  damping=0.5, stall_patience=10, margin_escalation=3.0,
-                 fallback=True):
+                 fallback=True, verbose=False, quiet=False):
     """
     Remove hard-macro overlaps via iterative Jacobi-style minimum-displacement bumping.
 
@@ -313,7 +294,8 @@ def bumpLegalize(pos, benchmark, halo_size=0.0, max_passes=80, margin_frac=5e-3,
             canvas_w, canvas_h, margin, damping)
 
         if count == 0:
-            print(f"    legalize bump: clean after {pass_num} Jacobi pass(es)", flush=True)
+            if not quiet:
+                print(f"    legalize bump: clean after {pass_num} Jacobi pass(es)", flush=True)
             return pos
 
         status = ""
@@ -325,28 +307,31 @@ def bumpLegalize(pos, benchmark, halo_size=0.0, max_passes=80, margin_frac=5e-3,
             best_count_pass = pass_num   # reset patience after escalation
             status = f"  [stalled → margin={margin:.5f}]"
 
-        print(f"    legalize bump pass {pass_num:3d}: "
-              f"{count} overlapping pairs"
-              f"{f'  ({unresolvable} both-fixed)' if unresolvable else ''}"
-              f"{status}", flush=True)
+        if verbose:
+            print(f"    legalize bump pass {pass_num:3d}: "
+                  f"{count} overlapping pairs"
+                  f"{f'  ({unresolvable} both-fixed)' if unresolvable else ''}"
+                  f"{status}", flush=True)
 
     # Phase 2: Gauss-Seidel cleanup for the small residual.
-    # Check with eff_sizes — if halo-pairs remain, clean them up.
     remaining_halo = len(_findOverlappingPairs(pos, num_hard, eff_sizes))
     if remaining_halo > 0:
         cleanup_margin = min_dim * 0.02
-        print(f"    legalize bump: {remaining_halo} halo-pairs remain — "
-              f"Gauss-Seidel cleanup (margin={cleanup_margin:.5f})", flush=True)
+        if not quiet:
+            print(f"    legalize bump: {remaining_halo} halo-pairs remain — "
+                  f"Gauss-Seidel cleanup (margin={cleanup_margin:.5f})", flush=True)
         remaining_phys = _gaussSeidelCleanup(pos, num_hard, phys_sizes, eff_sizes,
                                               fixed, canvas_w, canvas_h, cleanup_margin)
     else:
         remaining_phys = _countOverlaps(pos, num_hard, phys_sizes)
 
     if remaining_phys > 0:
-        print(f"    legalize bump: {remaining_phys} physical overlaps remain after cleanup", flush=True)
+        if not quiet:
+            print(f"    legalize bump: {remaining_phys} physical overlaps remain after cleanup", flush=True)
         if fallback:
-            print(f"    legalize bump: falling back to spiral", flush=True)
-            pos = spiralLegalize(pos, benchmark, max_passes=3)
+            if not quiet:
+                print(f"    legalize bump: falling back to spiral", flush=True)
+            pos = spiralLegalize(pos, benchmark, max_passes=3, verbose=verbose, quiet=quiet)
 
     return pos
 
@@ -406,84 +391,77 @@ def _runOnePass(pos, benchmark, step, max_ring):
     areas = sizes[:num_hard, 0] * sizes[:num_hard, 1]
     order = torch.argsort(areas, descending=True).tolist()
 
-    placed_cx, placed_cy = [], []
-    placed_w, placed_h = [], []
+    # Preallocate placed-macro arrays for vectorized conflict check
+    placed_cx = torch.zeros(num_hard, dtype=sizes.dtype)
+    placed_cy = torch.zeros(num_hard, dtype=sizes.dtype)
+    placed_w  = torch.zeros(num_hard, dtype=sizes.dtype)
+    placed_h  = torch.zeros(num_hard, dtype=sizes.dtype)
+    num_placed = 0
+
     num_moved = num_skipped = num_fallback = 0
 
     for idx in order:
         cx = float(pos[idx, 0])
         cy = float(pos[idx, 1])
-        w = float(sizes[idx, 0])
-        h = float(sizes[idx, 1])
+        w  = float(sizes[idx, 0])
+        h  = float(sizes[idx, 1])
 
         # Fixed macros are immovable obstacles
         if benchmark.macro_fixed[idx]:
-            placed_cx.append(cx)
-            placed_cy.append(cy)
-            placed_w.append(w)
-            placed_h.append(h)
+            placed_cx[num_placed] = cx
+            placed_cy[num_placed] = cy
+            placed_w[num_placed]  = w
+            placed_h[num_placed]  = h
+            num_placed += 1
             continue
 
-        # Check if current position is conflict-free
-        conflict = not _fitsCanvas(cx, cy, w, h, canvas_w, canvas_h)
-        if not conflict:
-            for pcx, pcy, pw, ph in zip(placed_cx, placed_cy, placed_w, placed_h):
-                if _hasOverlap(cx, cy, w, h, pcx, pcy, pw, ph):
-                    conflict = True
+        def _conflict(tx, ty):
+            # Canvas bounds check
+            if (tx - w * 0.5 < 0.0 or tx + w * 0.5 > canvas_w or
+                    ty - h * 0.5 < 0.0 or ty + h * 0.5 > canvas_h):
+                return True
+            if num_placed == 0:
+                return False
+            # Vectorized overlap check against all placed macros
+            ov_x = (placed_cx[:num_placed] - tx).abs()
+            ov_y = (placed_cy[:num_placed] - ty).abs()
+            return bool(((((placed_w[:num_placed] + w) * 0.5 - ov_x) > 0) &
+                          (((placed_h[:num_placed] + h) * 0.5 - ov_y) > 0)).any())
+
+        if not _conflict(cx, cy):
+            num_skipped += 1
+        else:
+            found = False
+            for ring in range(1, max_ring + 1):
+                for new_cx, new_cy in _spiralCandidates(cx, cy, ring, step):
+                    if not _conflict(new_cx, new_cy):
+                        pos[idx, 0] = new_cx
+                        pos[idx, 1] = new_cy
+                        cx, cy = new_cx, new_cy
+                        found = True
+                        break
+                if found:
                     break
 
-        if not conflict:
-            num_skipped += 1
-            placed_cx.append(cx)
-            placed_cy.append(cy)
-            placed_w.append(w)
-            placed_h.append(h)
-            continue
+            if found:
+                num_moved += 1
+            else:
+                cx = float(max(w * 0.5, min(canvas_w - w * 0.5, float(pos[idx, 0]))))
+                cy = float(max(h * 0.5, min(canvas_h - h * 0.5, float(pos[idx, 1]))))
+                pos[idx, 0] = cx
+                pos[idx, 1] = cy
+                num_fallback += 1
 
-        # Spiral search for conflict-free position
-        found = _searchSpiral(pos, idx, cx, cy, w, h, canvas_w, canvas_h,
-                              step, max_ring, placed_cx, placed_cy,
-                              placed_w, placed_h)
-
-        if found:
-            cx = float(pos[idx, 0])
-            cy = float(pos[idx, 1])
-            num_moved += 1
-        else:
-            cx = float(pos[idx, 0].clamp(w / 2.0, canvas_w - w / 2.0))
-            cy = float(pos[idx, 1].clamp(h / 2.0, canvas_h - h / 2.0))
-            pos[idx, 0] = cx
-            pos[idx, 1] = cy
-            num_fallback += 1
-
-        placed_cx.append(cx)
-        placed_cy.append(cy)
-        placed_w.append(w)
-        placed_h.append(h)
+        placed_cx[num_placed] = cx
+        placed_cy[num_placed] = cy
+        placed_w[num_placed]  = w
+        placed_h[num_placed]  = h
+        num_placed += 1
 
     return pos, num_moved, num_skipped, num_fallback
 
 
-def _searchSpiral(pos, idx, cx, cy, w, h, canvas_w, canvas_h,
-                  step, max_ring, placed_cx, placed_cy, placed_w, placed_h):
-    """Search outward in spiral rings for a conflict-free position."""
-    for ring in range(1, max_ring + 1):
-        for new_cx, new_cy in _spiralCandidates(cx, cy, ring, step):
-            if not _fitsCanvas(new_cx, new_cy, w, h, canvas_w, canvas_h):
-                continue
-            ok = True
-            for pcx, pcy, pw, ph in zip(placed_cx, placed_cy, placed_w, placed_h):
-                if _hasOverlap(new_cx, new_cy, w, h, pcx, pcy, pw, ph):
-                    ok = False
-                    break
-            if ok:
-                pos[idx, 0] = new_cx
-                pos[idx, 1] = new_cy
-                return True
-    return False
-
-
-def spiralLegalize(pos, benchmark, max_passes=3):
+def spiralLegalize(pos, benchmark, max_passes=3, verbose=False, quiet=False):
     """
     Remove hard-macro overlaps by greedy spiral push-out (legacy).
 
@@ -513,7 +491,8 @@ def spiralLegalize(pos, benchmark, max_passes=3):
             break
         pos, num_moved, num_skipped, num_fallback = _runOnePass(
             pos, benchmark, step, max_ring)
-        print(f"    legalize spiral pass {pass_num}: {num_skipped} already legal, "
-              f"{num_moved} moved, {num_fallback} fallback", flush=True)
+        if verbose:
+            print(f"    legalize spiral pass {pass_num}: {num_skipped} already legal, "
+                  f"{num_moved} moved, {num_fallback} fallback", flush=True)
 
     return pos

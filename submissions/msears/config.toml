@@ -10,10 +10,11 @@ quad_b2b_iters           = 6       # B2B refinement passes after CLIQUE warm-sta
 quad_net_size_threshold  = 50      # nets larger than this use star model instead of CLIQUE
 quad_anchor_fraction     = 0       # (0 = disabled)fraction of movable macros (ranked by area×net_degree) fixed as internal anchors in stage 1
 quad_scatter_fraction    = 0.1       # (0 = disabled) scatter+lock largest macros until their cumulative area >= this fraction of total movable area
+quad_scatter_lock_mult   = 10.0      # (0 = disabled) keep scatter macros fixed in mGP until lambda >= this × lambda_0
 
 # ── Phase 2: mGP — Mixed Global Placement ─────────────────────────────────
 mgp_enable            = true            # phase 2: run mixed global placement (set false to skip mGP entirely)
-use_gpu               = true            # use CUDA GPU if available; false forces CPU
+use_gpu               = true # use CUDA GPU if available; false forces CPU
 density_method        = "electrostatic" # "bell" or "electrostatic"
 density_grid_size     = 128             # override benchmark grid (null = use benchmark 45×41); try 64, 128, 256, 512
 use_preconditioner    = true            # divide gradient by (macro_area + net_degree)
@@ -67,7 +68,7 @@ hard_spread       = false  # enable phase 2.5
 hard_spread_iters = 50     # number of SGD iterations
 
 # ── Phase 3: mLG — Macro Legalization ─────────────────────────────────────
-legalization = "none"  # "none", "bump" (pairwise push-apart), or "spiral" (push-out from center)
+legalization = "bump"  # "none", "bump" (pairwise push-apart), or "spiral" (push-out from center)
 
 # ── Phase 3.5: Rotation Optimizer ─────────────────────────────────────────
 rotation_optimizer   = "greedy"   # "none", "greedy", "anneal", or "periodic"
@@ -101,18 +102,7 @@ quiet         = false
 highlight_macros        = []  # specific macro names to highlight in GIF; takes priority over highlight_random_macros
 highlight_random_macros = 0   # randomly highlight N macros by area (used only when highlight_macros is empty)
 highlight_scatter_macros = 5  # highlight the top N scattered macros (by area) from scatter_ids.pt; used when highlight_macros is empty
+highlight_io_nets       = 0   # highlight nets connecting to fixed I/O ports (0 = all IO nets, null/omit = disabled)
+legalization_details    = false  # print per-pass legalization progress lines (can be verbose)
+phase_banners           = true   # print a brief banner at the start and end of each placement phase
 
-# ── Genetic Algorithm (orientation search) ────────────────────────────────
-# Set ga_enable = true to run a GA before gradient descent to find the best hard-macro orientation assignment.
-[ga]
-ga_enable                  = false
-ga_population_size         = 16
-ga_n_generations           = 50
-ga_elite_frac              = 0.25   # top fraction preserved unchanged each generation
-ga_mutation_rate           = 0.05   # per-gene probability of random orientation flip
-ga_tournament_k            = 3      # tournament selection pool size
-ga_curtailed_iters         = 300    # max_iters for fast GA evaluation runs (no legalization)
-ga_fitness_wl_weight       = 1.0    # WL contribution to fitness
-ga_fitness_overflow_weight = 0.5    # overflow ratio contribution to fitness
-ga_n_workers               = 1      # >1 enables multiprocessing (not yet implemented)
-ga_seed                    = 0      # RNG seed for reproducible GA runs
