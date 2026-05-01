@@ -30,7 +30,7 @@ import math
 import torch
 
 # ---------------------------------------------------------------------------
-# Orientation matrices — D4 group, same encoding as genetic.py
+# Orientation matrices — D4 group (indices 0–7)
 # ---------------------------------------------------------------------------
 # Row i = [a, b, c, d]:  dx' = a*dx + b*dy,  dy' = c*dx + d*dy
 _ORI_MATRICES = torch.tensor(
