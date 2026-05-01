@@ -435,7 +435,7 @@ class CometPlacer:
         self.optimizer = p.get("optimizer", "sgd")
         self.alpha_init = None if p.get("alpha_init", "auto") == "auto" else float(p["alpha_init"])
         self.soft_place_iters = p.get("soft_place_iters", 1000)
-        self.rotation_optimizer  = p.get("rotation_optimizer", "none")   # none/greedy/anneal/periodic/genetic
+        self.rotation_optimizer  = p.get("rotation_optimizer", "none")   # none/greedy/anneal/periodic
         self.rotation_passes     = p.get("rotation_passes", 1)            # greedy: full passes over all macros
         self.rotation_period     = p.get("rotation_period", 20)           # periodic: iters between rotation calls
         self.sa_T_init           = p.get("sa_T_init", 1e-4)
