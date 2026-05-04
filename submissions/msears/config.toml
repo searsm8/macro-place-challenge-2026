@@ -9,20 +9,21 @@ center_init_spread       = 0.01    # fraction of canvas area for center-scatter 
 quad_b2b_iters           = 6       # B2B refinement passes after CLIQUE warm-start (0 = CLIQUE only)
 quad_net_size_threshold  = 50      # nets larger than this use star model instead of CLIQUE
 quad_anchor_fraction     = 0       # (0 = disabled)fraction of movable macros (ranked by area×net_degree) fixed as internal anchors in stage 1
-quad_scatter_fraction    = 0.1       # (0 = disabled) scatter+lock largest macros until their cumulative area >= this fraction of total movable area
-quad_scatter_lock_mult   = 10.0      # (0 = disabled) keep scatter macros fixed in mGP until lambda >= this × lambda_0
+quad_scatter_fraction    = 0.0       # (0 = disabled) scatter+lock largest macros until their cumulative area >= this fraction of total movable area
+quad_scatter_lock_mult   = 0.0      # (0 = disabled) keep scatter macros fixed in mGP until lambda >= this × lambda_0
 
 # ── Phase 2: mGP — Mixed Global Placement ─────────────────────────────────
 mgp_enable            = true            # phase 2: run mixed global placement (set false to skip mGP entirely)
 use_gpu               = true # use CUDA GPU if available; false forces CPU
 density_method        = "electrostatic" # "bell" or "electrostatic"
-density_grid_size     = 128             # override benchmark grid (null = use benchmark 45×41); try 64, 128, 256, 512
+density_grid_size     = 64             # override benchmark grid (null = use benchmark 45×41); try 64, 128, 256, 512
 use_preconditioner    = true            # divide gradient by (macro_area + net_degree)
 optimizer             = "bb_sgd"        # "sgd", "bb_sgd", or "nesterov"
 alpha_init            = "auto"          # initial step size for bb_sgd/nesterov
 max_iters             = 8000            # upper bound; early stopping usually fires first
 seed                  = 2
 deterministic         = true            # force deterministic GPU ops; ~10-30% slower
+
 gamma          = "auto"  # WA HPWL smoothness: "auto" (decay from canvas_diag/8), "ovfw" (overflow-driven, XPlace), or <float>
 gamma_decay    = 0.994   # multiply gamma by this each iteration
 gamma_min_frac = 0.00667 # gamma_min = canvas_diag * gamma_min_frac
@@ -51,14 +52,14 @@ warmup_iters            = 0
 lambda_iters_per_update = 1      # update lambda every N iters (1 = every iter)
 gamma_iters_per_update  = 1      # update gamma every N iters (1 = every iter)
 lambda_max              = 50000
-target_density          = 0.5
+target_density          = 0.65
 
 # ── mGP hard-macro density boost ──────────────────────────────────────────
 lambda_hm_init  = 1.0    # initial hard-macro density boost (1.0 = disabled); decays toward 1.0 each iter
 lambda_hm_decay = 0.995  # per-iter decay toward 1.0
 
 # ── mGP macro halos ───────────────────────────────────────────────────────
-halo_size     = 0.3   # inflate hard macro footprints in density map by this fraction (0 = disabled); e.g. 0.1 → (1.1w)×(1.1h), charge conserved via area_ratio
+halo_size     = 0.2   # inflate hard macro footprints in density map by this fraction (0 = disabled); e.g. 0.1 → (1.1w)×(1.1h), charge conserved via area_ratio
 halo_legalize = 0.1
 
 # ── Phase 2.5: Hard-macro spread ──────────────────────────────────────────

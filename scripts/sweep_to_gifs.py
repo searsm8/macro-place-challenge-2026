@@ -59,13 +59,26 @@ def find_latest_sweep() -> Path | None:
     return dirs[0] if dirs else None
 
 
+def _is_benchmark_dir(path: Path) -> bool:
+    """True if path looks like sweep_XXX/benchmark/ (contains run_NNN children)."""
+    return any(d.is_dir() and d.name.startswith("run_") for d in path.iterdir())
+
+
 def find_runs(sweep_path: Path, benchmark_filter: set[str] | None) -> list[tuple[Path, str]]:
-    """Return (run_dir, benchmark_name) pairs whose frames/ subdir has frames."""
+    """Return (run_dir, benchmark_name) pairs whose frames/ subdir has frames.
+
+    Accepts either a sweep root (sweep_XXX/) or a single benchmark directory
+    (sweep_XXX/ibm01/) — the latter lets you render one benchmark without
+    needing the --benchmark flag.
+    """
+    # Detect if the user passed a benchmark-level dir directly
+    if _is_benchmark_dir(sweep_path):
+        bench_dirs = [(sweep_path, sweep_path.name)]
+    else:
+        bench_dirs = [(d, d.name) for d in sorted(sweep_path.iterdir()) if d.is_dir()]
+
     runs = []
-    for bench_dir in sorted(sweep_path.iterdir()):
-        if not bench_dir.is_dir():
-            continue
-        bench_name = bench_dir.name
+    for bench_dir, bench_name in bench_dirs:
         if benchmark_filter and bench_name not in benchmark_filter:
             continue
         for run_dir in sorted(bench_dir.iterdir()):

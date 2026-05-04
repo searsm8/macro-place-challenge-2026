@@ -168,6 +168,33 @@ rank  avg_proxy   n_bench    params
 ```
 Status: QUALIFIED (0 overlaps). ibm01 improved from ~1.04 to ~0.99 with rotation refactor.
 
+## Best results per benchmark (valid runs only, 0 overlaps)
+
+These are the best proxy scores observed across all sweeps (including random seeds).
+Updated: 2026-05-04.
+
+| benchmark | proxy  | wl     | density | congestion | sweep / run                        |
+|-----------|--------|--------|---------|------------|------------------------------------|
+| ibm01     | 0.9147 | 0.0713 | 0.5466  | 1.1400     | sweep_20260504T142134Z / run_038   |
+| ibm02     | 1.3195 | 0.0984 | 0.5927  | 1.8495     | sweep_20260504T142134Z / run_042   |
+| ibm03     | 1.2021 | 0.1121 | 0.5470  | 1.6329     | sweep_20260502T002144Z / run_019   |
+| ibm04     | 1.1467 | 0.0921 | 0.5483  | 1.5610     | sweep_20260504T142134Z / run_043   |
+| ibm06     | 1.5793 | 0.1072 | 0.5849  | 2.3593     | sweep_20260502T002144Z / run_031   |
+| ibm07     | 1.3017 | 0.0834 | 0.5346  | 1.9019     | sweep_20260501T203044Z / run_013   |
+| ibm08     | 1.4220 | 0.0829 | 0.5815  | 2.0968     | sweep_20260501T184921Z / run_001   |
+| ibm09     | 0.9860 | 0.0716 | 0.5802  | 1.2486     | sweep_20260502T002144Z / run_002   |
+| ibm10     | 1.3112 | 0.0758 | 0.6504  | 1.8205     | sweep_20260501T184659Z / run_002   |
+| ibm11     | 1.0626 | 0.0704 | 0.5542  | 1.4303     | sweep_20260501T203044Z / run_015   |
+| ibm12     | 1.5020 | 0.0882 | 0.6041  | 2.2235     | sweep_20260502T002144Z / run_026   |
+| ibm13     | 1.1279 | 0.0702 | 0.5471  | 1.5684     | sweep_20260501T203044Z / run_015   |
+| ibm14     | 1.4493 | 0.0632 | 0.5675  | 2.2047     | sweep_20260502T002144Z / run_032   |
+| ibm15     | 1.4243 | 0.0732 | 0.5820  | 2.1202     | sweep_20260501T203044Z / run_014   |
+| ibm16     | 1.4029 | 0.0652 | 0.5502  | 2.1251     | sweep_20260502T002144Z / run_018   |
+| ibm17     | 1.5643 | 0.0616 | 0.6366  | 2.3688     | sweep_20260501T184921Z / run_003   |
+| ibm18     | 1.7328 | 0.0636 | 0.7062  | 2.6321     | sweep_20260501T184921Z / run_001   |
+
+To regenerate: `uv run python scripts/_best_results.py`
+
 ## Rotation optimizer design
 
 ### Correct E/W orientation handling

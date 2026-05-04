@@ -45,14 +45,11 @@ Usage
 COMBOS: list[dict] = [
      #{"mgp_enable": "true",  "legalization": "bump"},
      #{"mgp_enable": "false", "legalization": "none"},
-     {"initial_placement": "none"},
-     {"initial_placement": "center"},
-     {"initial_placement": "quadratic", "quad_scatter_lock_mult": 1e3},
-     {"initial_placement": "quadratic", "quad_scatter_lock_mult": 1e4},
-     {"initial_placement": "quadratic", "quad_scatter_lock_mult": 5e4},
-     {"initial_placement": "quadratic", "quad_scatter_lock_mult": 1e5},
-     {"initial_placement": "quadratic", "quad_scatter_lock_mult": 5e5},
-     {"initial_placement": "quadratic", "quad_scatter_lock_mult": 1e6},
+     #{"initial_placement": "none"},
+     #{"initial_placement": "center"},
+
+     #{"rotation_optimizer": "none"},
+     #{"rotation_optimizer": "greedy", "n_placement_passes": 2},
 ]
 
 SWEEP = {
@@ -87,15 +84,15 @@ SWEEP = {
     #"quad_net_size_threshold": [20, 80, 150],
     #"quad_anchor_fraction": [ 0, .1, .2, 0.97], # fraction of movable macros (ranked by area×net_degree) fixed as internal anchors in stage 1 (0 = disabled)
     #"density_grid_size": [75, 128, 256, 512],
-    #"target_density": [0.65, .70, .75, 0.80],
-    #"density_grid_size": [128,256,512,1024],
+    #"target_density": [0.55, 0.6, 0.65, 0.7, 0.75, 0.80, 0.85, 0.90],
+    #"density_grid_size": [64, 96, 128, 192],
     #"target_density": [0.65],
-    #"quad_scatter_fraction": [0, 0.1], # fraction of movable macros (ranked by area×net_degree) randomly scattered in stage 1 (0 = disabled)
     #"halo_size": [ 0.2, 0.25, 0.3, 0.35],
     #"soft_place": ["False", "True"],
     #"halo_size": [ 0.3],
     #"halo_legalize": [0.1, 0.15],
-    #"seed": [1, 2, 3, 4, 9, 14, 10, 7], # random seed for initial placement and mGP; affects all stochasticity when deterministic=false
+    #"seed": [1, 2, 3, 4, 9, 14, 10, 7, 5, 11, 20, 50], # random seed for initial placement and mGP; affects all stochasticity when deterministic=false
+    #"quad_scatter_fraction": [0, 0.1, 0.2, 0.3], # fraction of movable macros (ranked by area×net_degree) randomly scattered in stage 1 (0 = disabled)
     #"quad_scatter_lock_mult": [5, 10, 20, 50], # keep scatter macros fixed in mGP until lambda >= this × lambda_0
     #"mip_only": ["False", "True"], # skip mGP/cGP — legalize from mIP positions and return immediately (fast proxy for scatter quality)
 
@@ -127,7 +124,7 @@ UV          = "/home/msears/.local/bin/uv"
 
 IBM_BENCHMARKS = [
     "ibm01", "ibm02", "ibm03", "ibm04", "ibm06", "ibm07", "ibm08", "ibm09",
-    "ibm10", "ibm11", "ibm12", "ibm13", "ibm14", "ibm15", "ibm16", "ibm17", "ibm18",
+    #"ibm10", "ibm11", "ibm12", "ibm13", "ibm14", "ibm15", "ibm16", "ibm17", "ibm18",
 
     # small+medium+large subset for quick testing
     #"ibm01", "ibm04", "ibm14", # best avg for this subset: 1.3782
@@ -459,7 +456,7 @@ def main():
 
     record_frames = args.record_frames
     render_gifs   = args.render_gifs
-    n_workers     = min(args.workers, n_combos) if n_combos > 0 else 1
+    n_workers     = min(args.workers, n_jobs) if n_jobs > 0 else 1
 
     # Initialise both CSVs with headers before the loop so partial results are
     # written immediately after each run (safe to interrupt mid-sweep).
