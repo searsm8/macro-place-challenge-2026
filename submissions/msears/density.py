@@ -403,6 +403,52 @@ def _densityGradientBell(pos, benchmark, target_density):
 
 
 # ===========================================================================
+# Public Poisson gradient helper
+# ===========================================================================
+
+def computePoissonGradient(map_2d, pos, benchmark, grid_rows=None, grid_cols=None):
+    """
+    Run the Poisson FFT pipeline on an arbitrary zero-mean 2D map and return
+    repulsive forces at each macro position via bilinear interpolation.
+
+    The caller is responsible for zero-meaning the map before passing it in
+    (so the Neumann BCs are well-posed). Used for congestion gradient as well
+    as density gradient when a pre-built map is available.
+
+    Args:
+        map_2d     : [rows, cols] FloatTensor on the correct device
+        pos        : [n, 2] macro center positions
+        benchmark  : Benchmark (for canvas size)
+        grid_rows, grid_cols : override benchmark grid (must match map_2d shape)
+
+    Returns:
+        grad [n, 2] — repulsive force per macro (same sign convention as
+                      density gradient: pushes away from map peaks)
+    """
+    canvas_w = float(benchmark.canvas_width)
+    canvas_h = float(benchmark.canvas_height)
+    rows = grid_rows if grid_rows is not None else benchmark.grid_rows
+    cols = grid_cols if grid_cols is not None else benchmark.grid_cols
+    bin_w = canvas_w / cols
+    bin_h = canvas_h / rows
+
+    spectral = _getSpectralConstants(rows, cols, pos.dtype, pos.device)
+    expk_rows, expk_cols, wu_by_ww, wv_by_ww = spectral
+
+    with torch.no_grad():
+        field_ex, field_ey = _poissonFftSolve(
+            map_2d, bin_w, bin_h,
+            expk_rows, expk_cols, wu_by_ww, wv_by_ww)
+
+        force_x = -_bilinearInterp(field_ex, pos[:, 0], pos[:, 1],
+                                   bin_w, bin_h, rows, cols)
+        force_y = -_bilinearInterp(field_ey, pos[:, 0], pos[:, 1],
+                                   bin_w, bin_h, rows, cols)
+
+    return torch.stack([force_x, force_y], dim=1)
+
+
+# ===========================================================================
 # Public dispatcher
 # ===========================================================================
 

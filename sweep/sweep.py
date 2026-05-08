@@ -91,12 +91,16 @@ SWEEP = {
     #"soft_place": ["False", "True"],
     #"halo_size": [ 0.3],
     #"halo_legalize": [0.1, 0.15],
-    #"seed": [1, 2, 3, 4, 9, 14, 10, 7, 5, 11, 20, 50], # random seed for initial placement and mGP; affects all stochasticity when deterministic=false
     #"quad_scatter_fraction": [0, 0.1, 0.2, 0.3], # fraction of movable macros (ranked by area×net_degree) randomly scattered in stage 1 (0 = disabled)
     #"quad_scatter_lock_mult": [5, 10, 20, 50], # keep scatter macros fixed in mGP until lambda >= this × lambda_0
     #"mip_only": ["False", "True"], # skip mGP/cGP — legalize from mIP positions and return immediately (fast proxy for scatter quality)
 
-    #"quad_scatter_lock_mult": [1e3, 1e4, 1e5, 1e6], # keep scatter macros fixed in mGP until lambda >= this × lambda_0
+    "lambda_cong": [0.32], # congestion penalty weight (relative to density) in mGP
+    "lambda_cong_step": [ 1.01], # multiplicative increase of lambda_cong per mGP iteration (if >1, otherwise fixed)
+    #"quad_scatter_fraction": [0, 0.1, 0.15, 0.2], # keep scatter macros fixed in mGP until lambda >= this × lambda_0
+    "quad_scatter_n": [0, 1, 2, 4, 8, 12, 15, 20],  # keep scatter macros fixed in mGP until lambda >= this × lambda_0
+    "seed": [999, 9999, 99999, 999999], # random seed for initial placement and mGP; affects all stochasticity when deterministic=false
+    "quad_scatter_lock_mult": [0, 1e3, 1e4, 1e6], # keep scatter macros fixed in mGP until lambda >= this × lambda_0
 }
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -125,6 +129,8 @@ UV          = "/home/msears/.local/bin/uv"
 IBM_BENCHMARKS = [
     "ibm01", "ibm02", "ibm03", "ibm04", "ibm06", "ibm07", "ibm08", "ibm09",
     #"ibm10", "ibm11", "ibm12", "ibm13", "ibm14", "ibm15", "ibm16", "ibm17", "ibm18",
+
+    "ibm11", "ibm14", "ibm17",
 
     # small+medium+large subset for quick testing
     #"ibm01", "ibm04", "ibm14", # best avg for this subset: 1.3782

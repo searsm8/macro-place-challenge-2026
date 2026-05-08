@@ -41,24 +41,27 @@ from PIL import Image
 def _load_visualizer_config():
     """
     Read highlight settings from submissions/msears/config.toml.
-    Returns (highlight_macros, highlight_random_macros, highlight_scatter_macros, highlight_io_nets).
-    Falls back to ([], 0, 0, None) if the key / file is absent.
+    Returns (highlight_macros, highlight_random_macros, highlight_scatter_macros,
+             highlight_io_nets, show_congestion_heatmap).
+    Falls back to ([], 0, 0, None, False) if the key / file is absent.
     """
     import tomllib
     repo_root = Path(__file__).resolve().parent.parent
     cfg_path = repo_root / "submissions" / "msears" / "config.toml"
     if not cfg_path.exists():
-        return [], 0, 0, None
+        return [], 0, 0, None, False
     with open(cfg_path, "rb") as f:
         cfg = tomllib.load(f)
     out = cfg.get("output", {})
-    names     = list(out.get("highlight_macros", []))
-    n_rand    = int(out.get("highlight_random_macros", 0))
-    n_scatter = int(out.get("highlight_scatter_macros", 0))
-    n_io      = out.get("highlight_io_nets", None)
+    names       = list(out.get("highlight_macros", []))
+    n_rand      = int(out.get("highlight_random_macros", 0))
+    n_scatter   = int(out.get("highlight_scatter_macros", 0))
+    n_io        = out.get("highlight_io_nets", None)
     if n_io is not None:
         n_io = int(n_io)
-    return names, n_rand, n_scatter, n_io
+    show_cong   = bool(out.get("show_congestion_heatmap", False))
+    cong_gif    = bool(out.get("congestion_gif", False))
+    return names, n_rand, n_scatter, n_io, show_cong, cong_gif
 
 
 def _sample_highlight_ids(benchmark, n):
@@ -172,6 +175,10 @@ def parse_args():
     p.add_argument("--highlight-io", type=int, default=None, metavar="N",
                    help="Highlight up to N nets that connect to fixed I/O ports "
                         "(0 = all IO nets). Default: read highlight_io_nets from config.toml.")
+    p.add_argument("--congestion", action="store_true", default=False,
+                   help="Draw RUDY congestion heatmap as background (red = high demand)")
+    p.add_argument("--congestion-gif", action="store_true", default=False,
+                   help="Also export a congestion-only heatmap GIF alongside the normal GIF")
     return p.parse_args()
 
 
@@ -265,9 +272,62 @@ def load_benchmark_for_frames(benchmark_name):
     raise FileNotFoundError(f"Could not find benchmark '{benchmark_name}'")
 
 
+def render_congestion_frame(frame_data, benchmark, net_edges, save_path, dpi):
+    """Render a congestion-only heatmap frame (no macros or nets)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    import sys as _sys
+    repo_root = Path(__file__).resolve().parent.parent
+    subs_dir = str(repo_root / "submissions" / "msears")
+    if subs_dir not in _sys.path:
+        _sys.path.insert(0, subs_dir)
+    import congestion as _cong
+
+    positions = frame_data["positions"]
+    canvas_w  = frame_data["canvas_width"]
+    canvas_h  = frame_data["canvas_height"]
+    name      = frame_data["benchmark_name"]
+    iteration = frame_data["iter"]
+    phase     = frame_data.get("phase", "")
+
+    rudy = _cong.compute_rudy_map(
+        positions, net_edges,
+        canvas_w, canvas_h,
+        benchmark.grid_rows, benchmark.grid_cols,
+    )
+    rudy_np = rudy.cpu().numpy()
+    vmax = float(np.percentile(rudy_np, 99)) or 1e-6
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.set_xlim(0, canvas_w)
+    ax.set_ylim(0, canvas_h)
+    ax.set_aspect("equal")
+    im = ax.imshow(
+        rudy_np,
+        origin="lower",
+        extent=[0, canvas_w, 0, canvas_h],
+        cmap="Reds",
+        vmin=0,
+        vmax=vmax,
+        aspect="auto",
+    )
+    fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02, label="routing demand")
+    ax.set_title(f"{name}  |  iter {iteration:4d}   RUDY congestion", fontsize=9)
+    ax.tick_params(labelsize=7, labelbottom=False, labelleft=False)
+    if phase:
+        ax.text(0.98, -0.02, f"Phase {phase}", transform=ax.transAxes,
+                ha="right", va="top", fontsize=10, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
 def render_frame(frame_data, benchmark, net_edges, net_alpha, save_path, dpi,
                  highlight_ids=None, label_override=None,
-                 proxy_score=None, io_net_ids=None, bottom_left_text=None):
+                 proxy_score=None, io_net_ids=None, bottom_left_text=None,
+                 show_congestion=False):
     """
     Render a single frame to a PNG using a custom single-panel matplotlib figure.
 
@@ -300,6 +360,33 @@ def render_frame(frame_data, benchmark, net_edges, net_alpha, save_path, dpi,
     ax.set_aspect("equal")
     ax.add_patch(Rectangle((0, 0), canvas_w, canvas_h,
                             fill=False, edgecolor="black", linewidth=1.5))
+
+    # ── RUDY congestion heatmap (background, drawn first) ─────────────────
+    if show_congestion and net_edges is not None:
+        import sys as _sys
+        repo_root = Path(__file__).resolve().parent.parent
+        subs_dir = str(repo_root / "submissions" / "msears")
+        if subs_dir not in _sys.path:
+            _sys.path.insert(0, subs_dir)
+        import congestion as _cong
+        rudy = _cong.compute_rudy_map(
+            positions, net_edges,
+            canvas_w, canvas_h,
+            benchmark.grid_rows, benchmark.grid_cols,
+        )
+        rudy_np = rudy.cpu().numpy()
+        vmax = float(np.percentile(rudy_np, 99)) or 1e-6
+        ax.imshow(
+            rudy_np,
+            origin="lower",
+            extent=[0, canvas_w, 0, canvas_h],
+            cmap="Reds",
+            alpha=0.45,
+            vmin=0,
+            vmax=vmax,
+            aspect="auto",
+            zorder=0,
+        )
 
     # ── Pre-compute pin positions (reused for nets and pin dots) ─────────
     pin_pos = None
@@ -519,7 +606,9 @@ def main():
 
     # Resolve highlight macro names → indices.
     # Priority: --highlight CLI > highlight_macros config > scatter > random sampling.
-    cfg_names, cfg_n_random, cfg_n_scatter, cfg_n_io = _load_visualizer_config()
+    cfg_names, cfg_n_random, cfg_n_scatter, cfg_n_io, cfg_show_cong, cfg_cong_gif = _load_visualizer_config()
+    show_congestion = args.congestion or cfg_show_cong
+    make_congestion_gif = args.congestion_gif or cfg_cong_gif
     name_to_idx = {name: i for i, name in enumerate(benchmark.macro_names)}
 
     highlight_ids = set()
@@ -594,7 +683,8 @@ def main():
                      str(mip_png_path), dpi=150,
                      highlight_ids=highlight_ids or None,
                      label_override="mIP (quadratic init)",
-                     io_net_ids=io_nets)
+                     io_net_ids=io_nets,
+                     show_congestion=show_congestion)
         print(f"  Saved mIP image: {mip_png_path}")
         return
 
@@ -611,7 +701,8 @@ def main():
                      str(legal_png_path), dpi=150,
                      highlight_ids=highlight_ids or None,
                      proxy_score=proxy_score,
-                     io_net_ids=io_nets)
+                     io_net_ids=io_nets,
+                     show_congestion=show_congestion)
         print(f"  Saved legalized image: {legal_png_path}")
         return
 
@@ -648,7 +739,8 @@ def main():
                          str(png_path), args.dpi,
                          highlight_ids=highlight_ids or None,
                          proxy_score=frame_proxy,
-                         io_net_ids=io_nets)
+                         io_net_ids=io_nets,
+                         show_congestion=show_congestion)
             pil_frames.append(Image.open(png_path).copy())
             frame_durations.append(dur)
 
@@ -667,7 +759,8 @@ def main():
                          str(legal_png_path), dpi=150,
                          highlight_ids=highlight_ids or None,
                          proxy_score=proxy_score,
-                         io_net_ids=io_nets)
+                         io_net_ids=io_nets,
+                         show_congestion=show_congestion)
             print(f"\n  Saved legalized image: {legal_png_path}")
 
     print()  # newline after progress bar
@@ -685,6 +778,36 @@ def main():
     size_kb = output_path.stat().st_size / 1024
     print(f"done  ({size_kb:.0f} KB)")
     print(f"\n  Saved: {output_path}")
+
+    # -- Congestion-only GIF --------------------------------------------------
+    if make_congestion_gif and net_edges is not None:
+        cong_gif_path = output_path.with_name(
+            output_path.stem.replace("_opt", "") + "_congestion.gif"
+        )
+        print(f"  Rendering congestion GIF...", end=" ", flush=True)
+        cong_frames = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i, (frame_data, dur) in enumerate(ordered):
+                png_path = Path(tmpdir) / f"cong_{i:05d}.png"
+                render_congestion_frame(frame_data, benchmark, net_edges,
+                                        str(png_path), args.dpi)
+                cong_frames.append((Image.open(png_path).copy(), dur))
+                pct = (i + 1) / n_frames * 100
+                bar = "#" * int(pct / 2)
+                print(f"\r  Rendering congestion GIF [{bar:<50}] {pct:5.1f}%",
+                      end="", flush=True)
+        print()
+        imgs, durs = zip(*cong_frames)
+        imgs[0].save(
+            cong_gif_path,
+            save_all=True,
+            append_images=list(imgs[1:]),
+            duration=list(durs),
+            loop=0,
+            optimize=False,
+        )
+        size_kb = cong_gif_path.stat().st_size / 1024
+        print(f"  Saved congestion GIF: {cong_gif_path}  ({size_kb:.0f} KB)")
 
 
 if __name__ == "__main__":
