@@ -47,6 +47,8 @@ _density = _importSibling("density")
 _legalizer = _importSibling("legalizer")
 _output = _importSibling("output")
 _rotation = _importSibling("rotation")
+_congestion = _importSibling("congestion")
+_proxy = _importSibling("proxy")
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +171,7 @@ def _buildNetData(benchmark, plc):
     pin_to_macro = _buildPinToMacro(plc, name_to_bidx)
     port_pos = _buildPortPositions(plc)
 
-    return _flattenNets(plc, pin_to_macro, port_pos)
+    return _flattenNets(plc, pin_to_macro, port_pos, net_cnt=plc.net_cnt)
 
 
 def _buildNameToBidx(plc, num_hard):
@@ -205,12 +207,13 @@ def _buildPortPositions(plc):
     return port_pos
 
 
-def _flattenNets(plc, pin_to_macro, port_pos):
+def _flattenNets(plc, pin_to_macro, port_pos, net_cnt=None):
     """Flatten all nets into parallel pin arrays."""
     macro_ids_list = []
     ox_list = []
     oy_list = []
     net_ids_list = []
+    net_weights_list = []
     net_idx = 0
     num_skipped = 0
 
@@ -224,11 +227,15 @@ def _flattenNets(plc, pin_to_macro, port_pos):
                 px, py = port_pos[pin_name]
                 pins_this_net.append((-1, px, py))
         if len(pins_this_net) >= 2:
+            driver_idx = plc.mod_name_to_indices.get(driver)
+            weight = (plc.modules_w_pins[driver_idx].get_weight()
+                      if driver_idx is not None else 1.0)
             for (bidx, ox, oy) in pins_this_net:
                 macro_ids_list.append(bidx)
                 ox_list.append(ox)
                 oy_list.append(oy)
                 net_ids_list.append(net_idx)
+            net_weights_list.append(float(weight))
             net_idx += 1
         else:
             num_skipped += 1
@@ -240,15 +247,20 @@ def _flattenNets(plc, pin_to_macro, port_pos):
     offsets = torch.tensor(list(zip(ox_list, oy_list)), dtype=torch.float32)
     net_ids = torch.tensor(net_ids_list, dtype=torch.long)
     is_macro = (macro_ids >= 0)
+    net_weights = torch.tensor(net_weights_list, dtype=torch.float32)
 
     return {
         "macro_ids": macro_ids,
         "offsets": offsets,
         "net_ids": net_ids,
         "is_macro": is_macro,
+        "net_weights": net_weights,
         "num_pins": len(macro_ids_list),
         "num_nets": net_idx,
         "num_skipped": num_skipped,
+        # Weighted net count from plc (Σ weight_k over all nets with sinks).
+        # Used as WL normalisation denominator — matches harness exactly.
+        "plc_net_cnt": float(net_cnt) if net_cnt is not None else float(net_idx),
     }
 
 
@@ -385,6 +397,7 @@ class CometPlacer:
         cfg = config if config is not None else _loadConfig()
         params = cfg.get("params", {})
         output_cfg = cfg.get("output", {})
+        cong_cfg = cfg.get("congestion", {})
 
         self._readAlgorithmParams(params)
         self._readMethodParams(params)
@@ -393,6 +406,12 @@ class CometPlacer:
         self._readPlacementParams(params)
         self._out = _output.OutputManager(output_cfg)
         self._timer = PhaseTimer()
+
+        self.cong_rudy_enable    = _asBool(cong_cfg.get("cong_rudy_enable", False))
+        self.cong_rudy_grid_size = int(cong_cfg.get("cong_rudy_grid_size", 32))
+        self.lambda_cong                = float(cong_cfg.get("lambda_cong", 0.0))
+        self.lambda_cong_step           = float(cong_cfg.get("lambda_cong_step", 1.0))
+        self.lambda_cong_update_interval = int(cong_cfg.get("lambda_cong_update_interval", 3))
 
         self.last_metrics: dict = {}
 
@@ -483,6 +502,7 @@ class CometPlacer:
         self.quad_b2b_iters = p.get("quad_b2b_iters", 3)
         self.quad_net_size_threshold = p.get("quad_net_size_threshold", 50)
         self.quad_anchor_fraction   = p.get("quad_anchor_fraction", 0.0)
+        self.quad_scatter_n         = p.get("quad_scatter_n", 0)
         self.quad_scatter_fraction  = p.get("quad_scatter_fraction", 0.0)
         self.scatter_lock_mult      = p.get("quad_scatter_lock_mult", 0.0)
 
@@ -711,6 +731,23 @@ class CometPlacer:
             f"overlaps={costs['overlap_count']})"
         )
         self._out.saveProxyScore(costs)
+        _proxy.validate(pos, net_data, benchmark, plc)
+
+        if self.cong_rudy_enable:
+            gs = self.cong_rudy_grid_size
+            net_data_cpu = {k: v.cpu() if isinstance(v, torch.Tensor) else v
+                            for k, v in net_data.items()}
+            rudy_map = _congestion.compute_rudy_map(
+                pos.cpu(), net_data_cpu,
+                benchmark.canvas_width, benchmark.canvas_height,
+                gs, gs,
+            )
+            stats = _congestion.rudy_stats(rudy_map)
+            self._out.log(
+                f"  RUDY congestion : mean={stats['rudy_mean']:.4f}  "
+                f"p99={stats['rudy_p99']:.4f}  max={stats['rudy_max']:.4f}"
+                f"  (grid={gs}×{gs})"
+            )
 
         self._out.log(f"  Total time: {time.time()-start_time:.1f}s")
         self._timer.printReport()
@@ -975,6 +1012,7 @@ class CometPlacer:
             "pos": pos.clone(),
             "init_pos": pos.clone(),  # _clampPositions restores fixed macros to this
             "lambda_d": 0.0,
+            "lambda_cong_eff": 0.0,
             "lambda_hm": 1.0,         # no hard-macro boost; they're fixed anyway
             "hard_mask": benchmark.get_hard_macro_mask().to(self.device),
             "best_wl": float("inf"),
@@ -1106,6 +1144,7 @@ class CometPlacer:
             "pos": pos,
             "init_pos": init_pos,
             "lambda_d": 0.0,
+            "lambda_cong_eff": 0.0,
             "lambda_hm": self.lambda_hm_init,
             "hard_mask": benchmark.get_hard_macro_mask().to(self.device),
             "best_wl": float("inf"),
@@ -1201,6 +1240,7 @@ class CometPlacer:
             cfg = {"quad_b2b_iters": self.quad_b2b_iters,
                    "quad_net_size_threshold": self.quad_net_size_threshold,
                    "quad_anchor_fraction": self.quad_anchor_fraction,
+                   "quad_scatter_n": self.quad_scatter_n,
                    "quad_scatter_fraction": self.quad_scatter_fraction,
                    "seed": self.seed}
             self._out.log("  Quadratic WL init (mIP)...", flush=True)
@@ -1259,8 +1299,9 @@ class CometPlacer:
         wl_grad, wl_val = self._computeWlGradient(eval_pos, net_data, state["gamma"])
         den_grad, den_energy, overflow, max_den = self._computeDenGradient(
             t, eval_pos, benchmark, state)
+        cong_grad = self._computeCongGradient(t, eval_pos, net_data, benchmark, state, wl_grad)
 
-        grad = self._combineGradients(wl_grad, den_grad, state)
+        grad = self._combineGradients(wl_grad, den_grad, state, cong_grad)
 
         with torch.no_grad():
             grad[state["fixed_mask"]] = 0.0
@@ -1286,6 +1327,12 @@ class CometPlacer:
         # Decay hard-macro density boost toward 1.0
         if state["lambda_hm"] > 1.0:
             state["lambda_hm"] = max(1.0, state["lambda_hm"] * self.lambda_hm_decay)
+
+        # Ramp congestion weight
+        if (self.lambda_cong_step != 1.0
+                and state["lambda_cong_eff"] > 0.0
+                and t % self.lambda_cong_update_interval == 0):
+            state["lambda_cong_eff"] *= self.lambda_cong_step
 
         if self._out.shouldLog(t, self.max_iters):
             self._out.log(
@@ -1331,7 +1378,32 @@ class CometPlacer:
                 grid_cols=self.density_grid_cols)
         return (torch.zeros_like(state["pos"]), 0.0, float("inf"), float("inf"))
 
-    def _combineGradients(self, wl_grad, den_grad, state):
+    def _computeCongGradient(self, t, eval_pos, net_data, benchmark, state, wl_grad):
+        """Compute RUDY congestion gradient (or None when disabled/warmup).
+
+        On the first post-warmup call, auto-initialises lambda_cong_eff using
+        the same wl_norm / cong_norm ratio as _initLambda does for lambda_d.
+        """
+        if self.lambda_cong <= 0.0 or t < self.warmup_iters:
+            return None
+        rudy = _congestion.compute_rudy_map(
+            eval_pos, net_data,
+            float(benchmark.canvas_width), float(benchmark.canvas_height),
+            self.density_grid_rows, self.density_grid_cols,
+        )
+        rudy = rudy - rudy.mean()
+        cong_grad = _density.computePoissonGradient(
+            rudy, eval_pos, benchmark,
+            self.density_grid_rows, self.density_grid_cols,
+        )
+        if state["lambda_cong_eff"] == 0.0:
+            wl_norm   = wl_grad.norm(p=1).item()
+            cong_norm = cong_grad.norm(p=1).item()
+            state["lambda_cong_eff"] = self.lambda_cong * wl_norm / (cong_norm + 1e-8)
+            self._out.log(f"  lambda_cong init: {state['lambda_cong_eff']:.3e}")
+        return cong_grad
+
+    def _combineGradients(self, wl_grad, den_grad, state, cong_grad=None):
         """Combine WL and density gradients, apply preconditioner.
 
         Hard macros get an extra multiplier (lambda_hm) on their density
@@ -1341,6 +1413,8 @@ class CometPlacer:
         if state["lambda_hm"] > 1.0:
             scaled_den[state["hard_mask"]] *= state["lambda_hm"]
         grad = wl_grad + state["lambda_d"] * scaled_den
+        if cong_grad is not None:
+            grad = grad + state["lambda_cong_eff"] * cong_grad
         if state["precond"] is not None:
             grad = grad / state["precond"]
         return grad

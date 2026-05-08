@@ -39,14 +39,17 @@ import scipy.sparse.linalg
 import torch
 
 
-def select_scatter_ids(benchmark, scatter_fraction):
+def select_scatter_ids(benchmark, scatter_fraction, scatter_n=0):
     """
-    Return global hard-macro indices for scatter selection: the largest hard
-    movable macros whose cumulative area >= scatter_fraction * total
-    hard-movable area.  Returns an empty int64 array if fraction is 0 or
-    there are too few candidates (≤1 hard movable).
+    Return global hard-macro indices for scatter selection.
+
+    If scatter_n > 0: take the top-N largest hard movable macros (scatter_n takes
+    priority over scatter_fraction).
+    Otherwise if scatter_fraction > 0: take the largest until cumulative area
+    >= scatter_fraction * total hard-movable area.
+    Returns an empty int64 array if both are 0 or there are too few candidates.
     """
-    if scatter_fraction <= 0:
+    if scatter_n <= 0 and scatter_fraction <= 0:
         return np.empty(0, dtype=np.int64)
     num_macros = benchmark.num_macros
     half_w = benchmark.macro_sizes[:num_macros, 0].numpy() / 2
@@ -58,10 +61,13 @@ def select_scatter_ids(benchmark, scatter_fraction):
         return np.empty(0, dtype=np.int64)
     areas = (half_w * half_h)[hard_movable]
     ranked = np.argsort(areas)[::-1]
-    cutoff = np.searchsorted(
-        np.cumsum(areas[ranked]), scatter_fraction * areas.sum(), side="left"
-    )
-    n_scatter = min(int(cutoff) + 1, len(hard_movable) - 1)
+    if scatter_n > 0:
+        n_scatter = min(int(scatter_n), len(hard_movable) - 1)
+    else:
+        cutoff = np.searchsorted(
+            np.cumsum(areas[ranked]), scatter_fraction * areas.sum(), side="left"
+        )
+        n_scatter = min(int(cutoff) + 1, len(hard_movable) - 1)
     return hard_movable[ranked[:n_scatter]]
 
 
@@ -83,7 +89,8 @@ def quadratic_init(net_data, benchmark, cfg):
     b2b_iters        = cfg.get("quad_b2b_iters", 3)
     net_size_thresh  = cfg.get("quad_net_size_threshold", 50)
     anchor_fraction  = cfg.get("quad_anchor_fraction", 0.0)
-    scatter_fraction = cfg.get("quad_scatter_fraction", 0.0)
+    scatter_n        = cfg.get("quad_scatter_n", 0)
+    scatter_fraction = cfg.get("quad_scatter_fraction", 0.0) if scatter_n <= 0 else 0.0
 
     num_macros = benchmark.num_macros
     canvas_w   = float(benchmark.canvas_width)
@@ -118,50 +125,42 @@ def quadratic_init(net_data, benchmark, cfg):
     net_ends   = np.searchsorted(s_net, np.arange(num_nets), side="right")
 
     # ── Scatter-and-lock: randomly place biggest hard macros, then fix them ──
-    if scatter_fraction > 0:
-        # Candidate pool: movable hard macros only
-        hard_movable = movable_ids[movable_ids < benchmark.num_hard_macros]
-        if len(hard_movable) > 1:
-            # Select largest until cumulative area >= scatter_fraction * total hard-movable area
-            areas = (half_w * half_h)[hard_movable]
-            ranked = np.argsort(areas)[::-1]
-            cutoff = np.searchsorted(np.cumsum(areas[ranked]), scatter_fraction * areas.sum(), side="left")
-            n_scatter = min(int(cutoff) + 1, len(hard_movable) - 1)
-            scatter_ids = hard_movable[ranked[:n_scatter]]
-            remain_ids  = movable_ids[~np.isin(movable_ids, scatter_ids)]
+    scatter_ids = select_scatter_ids(benchmark, scatter_fraction, scatter_n)
+    if len(scatter_ids) > 0:
+        remain_ids  = movable_ids[~np.isin(movable_ids, scatter_ids)]
 
-            # Random placement within valid canvas bounds
-            rng = np.random.default_rng(cfg.get("seed", 42))
-            scatter_pos = np.empty((n_scatter, 2), dtype=np.float64)
-            scatter_pos[:, 0] = rng.uniform(half_w[scatter_ids], canvas_w - half_w[scatter_ids])
-            scatter_pos[:, 1] = rng.uniform(half_h[scatter_ids], canvas_h - half_h[scatter_ids])
+        # Random placement within valid canvas bounds
+        rng = np.random.default_rng(cfg.get("seed", 42))
+        scatter_pos = np.empty((len(scatter_ids), 2), dtype=np.float64)
+        scatter_pos[:, 0] = rng.uniform(half_w[scatter_ids], canvas_w - half_w[scatter_ids])
+        scatter_pos[:, 1] = rng.uniform(half_h[scatter_ids], canvas_h - half_h[scatter_ids])
 
-            # Fix scattered macros; solve quadratic for the rest
-            fixed_s2   = fixed_mask_np.copy()
-            fixed_s2[scatter_ids] = True
-            centers_s2 = macro_centers.copy()
-            centers_s2[scatter_ids] = scatter_pos
+        # Fix scattered macros; solve quadratic for the rest
+        fixed_s2   = fixed_mask_np.copy()
+        fixed_s2[scatter_ids] = True
+        centers_s2 = macro_centers.copy()
+        centers_s2[scatter_ids] = scatter_pos
 
-            g2l_s2 = np.full(num_macros, -1, dtype=np.int64)
-            g2l_s2[remain_ids] = np.arange(len(remain_ids))
+        g2l_s2 = np.full(num_macros, -1, dtype=np.int64)
+        g2l_s2[remain_ids] = np.arange(len(remain_ids))
 
-            s_loc_s2, s_fix_s2, s_fpos_s2 = _classify_pins(
-                s_mid, s_ism, s_ofs, fixed_s2, centers_s2, g2l_s2)
+        s_loc_s2, s_fix_s2, s_fpos_s2 = _classify_pins(
+            s_mid, s_ism, s_ofs, fixed_s2, centers_s2, g2l_s2)
 
-            pos_s2 = np.empty((len(remain_ids), 2), dtype=np.float64)
-            pos_s2[:, 0] = canvas_w / 2.0
-            pos_s2[:, 1] = canvas_h / 2.0
+        pos_s2 = np.empty((len(remain_ids), 2), dtype=np.float64)
+        pos_s2[:, 0] = canvas_w / 2.0
+        pos_s2[:, 1] = canvas_h / 2.0
+        pos_s2 = _solve(pos_s2, len(remain_ids), num_nets, net_starts, net_ends,
+                        s_loc_s2, s_fix_s2, s_fpos_s2, s_ofs, net_size_thresh, b2b_pos=None)
+        _clamp(pos_s2, remain_ids, half_w, half_h, canvas_w, canvas_h)
+
+        for _ in range(b2b_iters):
             pos_s2 = _solve(pos_s2, len(remain_ids), num_nets, net_starts, net_ends,
-                            s_loc_s2, s_fix_s2, s_fpos_s2, s_ofs, net_size_thresh, b2b_pos=None)
+                            s_loc_s2, s_fix_s2, s_fpos_s2, s_ofs, net_size_thresh, b2b_pos=pos_s2)
             _clamp(pos_s2, remain_ids, half_w, half_h, canvas_w, canvas_h)
 
-            for _ in range(b2b_iters):
-                pos_s2 = _solve(pos_s2, len(remain_ids), num_nets, net_starts, net_ends,
-                                s_loc_s2, s_fix_s2, s_fpos_s2, s_ofs, net_size_thresh, b2b_pos=pos_s2)
-                _clamp(pos_s2, remain_ids, half_w, half_h, canvas_w, canvas_h)
-
-            return _scatter_result(benchmark, num_macros, half_w, half_h, canvas_w, canvas_h,
-                                   {tuple(scatter_ids): scatter_pos, tuple(remain_ids): pos_s2}), scatter_ids
+        return _scatter_result(benchmark, num_macros, half_w, half_h, canvas_w, canvas_h,
+                               {tuple(scatter_ids): scatter_pos, tuple(remain_ids): pos_s2}), scatter_ids
 
     # ── Two-stage anchor placement ───────────────────────────────────────────
     if anchor_fraction > 0:
