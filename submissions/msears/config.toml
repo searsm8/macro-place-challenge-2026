@@ -10,7 +10,7 @@ quad_b2b_iters           = 6       # B2B refinement passes after CLIQUE warm-sta
 quad_net_size_threshold  = 50      # nets larger than this use star model instead of CLIQUE
 quad_anchor_fraction     = 0       # (0 = disabled)fraction of movable macros (ranked by area×net_degree) fixed as internal anchors in stage 1
 quad_scatter_n           = 0         # (0 = disabled) scatter+lock exactly N largest hard macros; overrides quad_scatter_fraction when non-zero
-quad_scatter_fraction    = 0.1       # (0 = disabled) scatter+lock largest macros until their cumulative area >= this fraction of total movable area
+quad_scatter_fraction    = 0.0       # (0 = disabled) scatter+lock largest macros until their cumulative area >= this fraction of total movable area
 quad_scatter_lock_mult   = 0.0      # (0 = disabled) keep scatter macros fixed in mGP until lambda >= this × lambda_0
 
 # ── Phase 2: mGP — Mixed Global Placement ─────────────────────────────────
@@ -40,7 +40,7 @@ divergence_window  = 50     # stop if overflow rising AND wl > 5× best wl (last
 lambda_schedule         = "hpwl"  # "hpwl" (feedback) or "geometric" (fixed ramp)
 
 # hpwl mode
-lambda                  = 8e-2
+lambda_density_init     = 8e-2
 lambda_pcof_upper       = 1.05   # multiplier when overflow is NOT improving (ramp hard)
 lambda_pcof_lower       = 1.01   # multiplier when overflow IS actively decreasing (gentle ramp)
 
@@ -60,7 +60,7 @@ lambda_hm_init  = 1.0    # initial hard-macro density boost (1.0 = disabled); de
 lambda_hm_decay = 0.995  # per-iter decay toward 1.0
 
 # ── mGP macro halos ───────────────────────────────────────────────────────
-halo_size     = 0.2   # inflate hard macro footprints in density map by this fraction (0 = disabled); e.g. 0.1 → (1.1w)×(1.1h), charge conserved via area_ratio
+halo_size     = 0.25   # inflate hard macro footprints in density map by this fraction (0 = disabled); e.g. 0.1 → (1.1w)×(1.1h), charge conserved via area_ratio
 halo_legalize = 0.1
 
 # ── Phase 2.5: Hard-macro spread ──────────────────────────────────────────
@@ -84,8 +84,10 @@ n_placement_passes   = 2          # run full pipeline this many times, locking o
 
 # ── Phase 4: cGP — Cell Global Placement ──────────────────────────────────
 # Lock hard macros; re-run WL + density descent for soft macros only.
-soft_place       = false   # enable phase 4
-soft_place_iters = 5000   # max iterations (early stopping applies)
+cGP_enable           = false  # enable phase 4
+cGP_iters            = 5000   # max iterations (early stopping applies)
+cGP_position_reset   = false  # reset soft macros to canvas center before cGP
+cGP_lambda_cong_init = 0.0    # congestion gradient weight relative to HPWL (0 = disabled)
 
 # ── Convergence checks (apply to both mGP and cGP) ────────────────────────
 # Disable individually to isolate their effect (all default true).
@@ -99,7 +101,7 @@ convergence_countdown = 30  # extra iters to run after convergence before stoppi
 [congestion]
 cong_rudy_enable    = true   # compute RUDY congestion map after placement (diagnostic only for now)
 cong_rudy_grid_size = 32     # grid resolution (square); independent of density_grid_size
-lambda_cong                = 0.3   # congestion spreading weight (0 = disabled); auto-scaled like lambda
+lambda_cong                = 0.32   # congestion spreading weight (0 = disabled); auto-scaled like lambda
                                     # so 0.25 means "cong force = 25% of WL force at warmup transition"
                                     # paper (Spindler 2007) found optimal w_rout ≈ 0.32
 lambda_cong_step           = 1.01    # multiply lambda_cong_eff by this every lambda_cong_interval iters
@@ -116,7 +118,11 @@ highlight_random_macros = 0   # randomly highlight N macros by area (used only w
 highlight_scatter_macros = 5  # highlight the top N scattered macros (by area) from scatter_ids.pt; used when highlight_macros is empty
 highlight_io_nets       = 0   # highlight nets connecting to fixed I/O ports (0 = all IO nets, null/omit = disabled)
 show_congestion_heatmap = true  # draw RUDY congestion heatmap as background (red = high demand)
-congestion_gif          = true # also export a congestion-only heatmap GIF
+congestion_gif          = true  # also export a congestion-only heatmap GIF
+show_io_nets            = false # draw nets that connect to an I/O pad
+show_other_nets         = true # draw nets NOT connected to I/O pads
+show_hard_macros        = false # draw hard macros (steelblue)
+show_soft_macros        = true  # draw soft macros (mediumseagreen)
 legalization_details    = false  # print per-pass legalization progress lines (can be verbose)
 phase_banners           = true   # print a brief banner at the start and end of each placement phase
 

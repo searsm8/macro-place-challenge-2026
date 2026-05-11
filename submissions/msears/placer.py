@@ -421,7 +421,7 @@ class CometPlacer:
     def _readAlgorithmParams(self, p):
         self.mgp_enable = _asBool(p.get("mgp_enable", True))
         self.max_iters = p.get("max_iters", 2000)
-        self.soft_place_iters = p.get("soft_place_iters", 1000)
+        self.cgp_iters = p.get("cGP_iters", p.get("soft_place_iters", 1000))
         self.seed = p.get("seed", 42)
         self.deterministic = _asBool(p.get("deterministic", False))
         gamma_cfg = p.get("gamma", "auto")
@@ -442,7 +442,9 @@ class CometPlacer:
     def _readMethodParams(self, p):
         self.density_method = p.get("density_method", "electrostatic")
         self.legalization = p.get("legalization", "none")
-        self.soft_place = _asBool(p.get("soft_place", False))
+        self.cgp_enable = _asBool(p.get("cGP_enable", p.get("soft_place", False)))
+        self.cgp_position_reset = _asBool(p.get("cGP_position_reset", False))
+        self.cgp_lambda_cong_init = float(p.get("cGP_lambda_cong_init", 0.0))
         self.hard_spread = _asBool(p.get("hard_spread", False))
         self.hard_spread_iters = p.get("hard_spread_iters", 50)
         self.halo_size = float(p.get("halo_size", 0.0))
@@ -453,7 +455,6 @@ class CometPlacer:
         self.use_precond = _asBool(p.get("use_preconditioner", True))
         self.optimizer = p.get("optimizer", "sgd")
         self.alpha_init = None if p.get("alpha_init", "auto") == "auto" else float(p["alpha_init"])
-        self.soft_place_iters = p.get("soft_place_iters", 1000)
         self.rotation_optimizer  = p.get("rotation_optimizer", "none")   # none/greedy/anneal/periodic
         self.rotation_passes     = p.get("rotation_passes", 1)            # greedy: full passes over all macros
         self.rotation_period     = p.get("rotation_period", 20)           # periodic: iters between rotation calls
@@ -470,7 +471,7 @@ class CometPlacer:
 
     def _readLambdaParams(self, p):
         self.lambda_schedule = p.get("lambda_schedule", "hpwl")
-        self.density_weight = p.get("lambda", 8e-4)
+        self.density_weight = p.get("lambda_density_init", 8e-4)
         self.lambda_pcof_upper = p.get("lambda_pcof_upper", 1.05)
         self.lambda_pcof_lower = p.get("lambda_pcof_lower", 0.95)
         self.density_weight_init = p.get("density_weight_init", 1e-5)
@@ -823,7 +824,7 @@ class CometPlacer:
         snapshots.append({"phase": "3: mLG", "hpwl": _exactHpwl(pos_p3, net_data_cpu), "overflow": None, "hard_overlaps": _legalizer._countOverlaps(pos_p3, nh, sizes_cpu), "soft_disp": soft_disp_p3})
 
         # Phase 4: cGP
-        if self.soft_place and benchmark.num_soft_macros > 0:
+        if self.cgp_enable and benchmark.num_soft_macros > 0:
             self._out.banner("Phase 4: cGP")
             self._timer.start("cGP")
             state["pos"] = self._cellGlobalPlacement(state["pos"], benchmark, net_data,
@@ -1030,36 +1031,36 @@ class CometPlacer:
             "scatter_lock_mask": torch.zeros(num_macros, dtype=torch.bool, device=self.device),
         }
 
-        # Scatter soft macros uniformly across the canvas as a fresh start.
-        # Hard macro positions in state["pos"] are already locked via fixed_mask
-        # and will be restored each iteration by _clampPositions, so overwriting
-        # the soft rows here is safe.
-        #num_hard = benchmark.num_hard_macros
-        #soft_hw = half_w[num_hard:]
-        #soft_hh = half_h[num_hard:]
-        #state["pos"][num_hard:, 0] = torch.empty(benchmark.num_soft_macros).uniform_(0, 1) \
-        #    * (canvas_w - 2 * soft_hw.mean()) + soft_hw.mean()
-        #state["pos"][num_hard:, 1] = torch.empty(benchmark.num_soft_macros).uniform_(0, 1) \
-        #    * (canvas_h - 2 * soft_hh.mean()) + soft_hh.mean()
-        #state["pos"][num_hard:, 0] = state["pos"][num_hard:, 0].clamp(
-        #    soft_hw, canvas_w - soft_hw)
-        #state["pos"][num_hard:, 1] = state["pos"][num_hard:, 1].clamp(
-        #    soft_hh, canvas_h - soft_hh)
-        #state["best_pos"] = state["pos"].clone()
+        # Optionally reset soft macros to canvas center before optimizing.
+        # Hard macro positions are locked via fixed_mask and restored each iter.
+        if self.cgp_position_reset:
+            num_hard = benchmark.num_hard_macros
+            with torch.no_grad():
+                state["pos"][num_hard:, 0] = canvas_w / 2.0
+                state["pos"][num_hard:, 1] = canvas_h / 2.0
+            state["best_pos"] = state["pos"].clone()
+
+        # Seed lambda_cong_eff from config if provided; _computeCongGradient will
+        # auto-scale on first call only when lambda_cong_eff == 0.
+        if self.cgp_lambda_cong_init > 0.0:
+            state["lambda_cong_eff"] = self.cgp_lambda_cong_init
 
         self._out.log(
             f"  Phase 4 (cGP): {benchmark.num_soft_macros} soft macros free  "
-            f"max_iters={self.soft_place_iters}  warmup={self.warmup_iters}  "
-            f"gamma0={gamma:.3f}")
+            f"max_iters={self.cgp_iters}  warmup={self.warmup_iters}  "
+            f"gamma0={gamma:.3f}  pos_reset={self.cgp_position_reset}  "
+            f"lambda_cong_init={self.cgp_lambda_cong_init}")
 
-        for t in range(self.soft_place_iters):
+        for t in range(self.cgp_iters):
             eval_pos = state["pos"]
 
             wl_grad, wl_val = self._computeWlGradient(eval_pos, net_data, state["gamma"])
             den_grad, den_energy, overflow, max_den = self._computeDenGradient(
                 t, eval_pos, benchmark, state)
+            cong_grad = self._computeCongGradient(
+                t, eval_pos, net_data, benchmark, state, wl_grad)
 
-            grad = self._combineGradients(wl_grad, den_grad, state)
+            grad = self._combineGradients(wl_grad, den_grad, state, cong_grad)
 
             with torch.no_grad():
                 grad[fixed_mask] = 0.0
@@ -1072,7 +1073,7 @@ class CometPlacer:
             if t % self.gamma_iters_per_update == 0:
                 self._stepGamma(state, overflow)
 
-            if self._out.shouldLog(t, self.soft_place_iters):
+            if self._out.shouldLog(t, self.cgp_iters):
                 self._out.log(
                     f"    [cGP] iter {t:4d}  wl={wl_val:.4f}  "
                     f"den={den_energy:.4f}  ovf={overflow:.4f}  "
@@ -1094,7 +1095,7 @@ class CometPlacer:
 
         self._out.log(f"  [cGP] done  iters={t + 1}  wl={state['prev_wl']:.4f}")
         self._out.banner(f"Phase 4: cGP  done (iters={t + 1})")
-        return state["best_pos"]
+        return state["pos"]
 
     def _initState(self, benchmark, net_data):
         """Initialise all loop state variables."""

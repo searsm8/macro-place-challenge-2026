@@ -18,7 +18,7 @@ import torch
 # Vectorized geometry helpers
 # ---------------------------------------------------------------------------
 
-def _countOverlaps(pos, num_hard, sizes):
+def _countOverlaps(pos, num_hard, sizes, upper=None):
     """Count overlapping hard macro pairs."""
     cx = pos[:num_hard, 0]
     cy = pos[:num_hard, 1]
@@ -28,11 +28,12 @@ def _countOverlaps(pos, num_hard, sizes):
     dy = (cy.unsqueeze(1) - cy.unsqueeze(0)).abs()
     ov = ((w.unsqueeze(1) + w.unsqueeze(0)) * 0.5 - dx > 0) & \
          ((h.unsqueeze(1) + h.unsqueeze(0)) * 0.5 - dy > 0)
-    upper = torch.triu(torch.ones(num_hard, num_hard, dtype=torch.bool), diagonal=1)
+    if upper is None:
+        upper = torch.triu(torch.ones(num_hard, num_hard, dtype=torch.bool), diagonal=1)
     return int((ov & upper).sum())
 
 
-def _findOverlappingPairs(pos, num_hard, sizes):
+def _findOverlappingPairs(pos, num_hard, sizes, upper=None):
     """
     Return a list of (severity, i, j) for every overlapping pair.
     severity = min(ov_x, ov_y) — penetration depth along the easier-to-clear axis.
@@ -45,7 +46,8 @@ def _findOverlappingPairs(pos, num_hard, sizes):
     dy = (cy.unsqueeze(1) - cy.unsqueeze(0)).abs()
     ov_x = (w.unsqueeze(1) + w.unsqueeze(0)) * 0.5 - dx
     ov_y = (h.unsqueeze(1) + h.unsqueeze(0)) * 0.5 - dy
-    upper = torch.triu(torch.ones(num_hard, num_hard, dtype=torch.bool), diagonal=1)
+    if upper is None:
+        upper = torch.triu(torch.ones(num_hard, num_hard, dtype=torch.bool), diagonal=1)
     mask = (ov_x > 0) & (ov_y > 0) & upper
     i_idx, j_idx = mask.nonzero(as_tuple=True)
     if i_idx.numel() == 0:
@@ -146,26 +148,42 @@ def _gaussSeidelCleanup(pos, num_hard, phys_sizes, eff_sizes, fixed,
     ew = eff_sizes[:num_hard, 0]
     eh = eff_sizes[:num_hard, 1]
 
-    pairs = _findOverlappingPairs(pos, num_hard, eff_sizes)
-    for _ in range(max_cleanup_passes):
+    # Precompute upper mask once (never changes).
+    upper = torch.triu(torch.ones(num_hard, num_hard, dtype=torch.bool), diagonal=1)
+    pairs = _findOverlappingPairs(pos, num_hard, eff_sizes, upper=upper)
+
+    # pos[:num_hard].numpy() is a zero-copy view — mutations to pos_np propagate to pos.
+    pos_np   = pos[:num_hard].numpy()
+    ew_np    = ew.numpy()
+    eh_np    = eh.numpy()
+    pw_np    = pw.numpy()
+    ph_np    = ph.numpy()
+    fixed_np = fixed.bool().numpy()
+    pw_half  = pw_np * 0.5
+    ph_half  = ph_np * 0.5
+
+    # Full O(n²) rebuild period — catches any new overlaps created by bumping.
+    _REBUILD_EVERY = 20
+
+    for pass_num in range(max_cleanup_passes):
         if not pairs:
             break
         pairs.sort(reverse=True)   # deepest halo-overlap first
 
         any_moved = False
         for _, i, j in pairs:
-            cx_i = float(pos[i, 0])
-            cy_i = float(pos[i, 1])
-            cx_j = float(pos[j, 0])
-            cy_j = float(pos[j, 1])
+            cx_i = pos_np[i, 0]
+            cy_i = pos_np[i, 1]
+            cx_j = pos_np[j, 0]
+            cy_j = pos_np[j, 1]
 
-            ov_x = float(ew[i] + ew[j]) * 0.5 - abs(cx_i - cx_j)
-            ov_y = float(eh[i] + eh[j]) * 0.5 - abs(cy_i - cy_j)
+            ov_x = float(ew_np[i] + ew_np[j]) * 0.5 - abs(cx_i - cx_j)
+            ov_y = float(eh_np[i] + eh_np[j]) * 0.5 - abs(cy_i - cy_j)
             if ov_x <= 0.0 or ov_y <= 0.0:
                 continue
 
-            fi = bool(fixed[i])
-            fj = bool(fixed[j])
+            fi = bool(fixed_np[i])
+            fj = bool(fixed_np[j])
             if fi and fj:
                 continue
 
@@ -184,8 +202,8 @@ def _gaussSeidelCleanup(pos, num_hard, phys_sizes, eff_sizes, fixed,
                 push_x = 0.0
                 push_y = sign_y * (ov_y + margin)
 
-            ai = float(pw[i]) * float(ph[i])
-            aj = float(pw[j]) * float(ph[j])
+            ai = float(pw_np[i]) * float(ph_np[i])
+            aj = float(pw_np[j]) * float(ph_np[j])
             total_a = ai + aj
 
             if not fi and not fj:
@@ -196,22 +214,29 @@ def _gaussSeidelCleanup(pos, num_hard, phys_sizes, eff_sizes, fixed,
             else:
                 frac_i, frac_j = 0.0, 1.0
 
-            wpi_h = float(pw[i]) * 0.5
-            hpi_h = float(ph[i]) * 0.5
-            pos[i, 0] = max(wpi_h, min(canvas_w - wpi_h, cx_i + push_x * frac_i))
-            pos[i, 1] = max(hpi_h, min(canvas_h - hpi_h, cy_i + push_y * frac_i))
-
-            wpj_h = float(pw[j]) * 0.5
-            hpj_h = float(ph[j]) * 0.5
-            pos[j, 0] = max(wpj_h, min(canvas_w - wpj_h, cx_j - push_x * frac_j))
-            pos[j, 1] = max(hpj_h, min(canvas_h - hpj_h, cy_j - push_y * frac_j))
+            pos_np[i, 0] = max(pw_half[i], min(canvas_w - pw_half[i], cx_i + push_x * frac_i))
+            pos_np[i, 1] = max(ph_half[i], min(canvas_h - ph_half[i], cy_i + push_y * frac_i))
+            pos_np[j, 0] = max(pw_half[j], min(canvas_w - pw_half[j], cx_j - push_x * frac_j))
+            pos_np[j, 1] = max(ph_half[j], min(canvas_h - ph_half[j], cy_j - push_y * frac_j))
             any_moved = True
 
         if not any_moved:
             break   # all remaining pairs are both-fixed or geometry-degenerate
-        pairs = _findOverlappingPairs(pos, num_hard, eff_sizes)
 
-    return _countOverlaps(pos, num_hard, phys_sizes)
+        # Rebuild pair list: full O(n²) scan every _REBUILD_EVERY passes to catch new
+        # overlaps; otherwise a fast O(P) vectorized re-filter of the existing pair set.
+        if (pass_num + 1) % _REBUILD_EVERY == 0:
+            pairs = _findOverlappingPairs(pos, num_hard, eff_sizes, upper=upper)
+        elif pairs:
+            i_t = torch.tensor([p[1] for p in pairs], dtype=torch.long)
+            j_t = torch.tensor([p[2] for p in pairs], dtype=torch.long)
+            ov_x_t = (ew[i_t] + ew[j_t]) * 0.5 - (pos[i_t, 0] - pos[j_t, 0]).abs()
+            ov_y_t = (eh[i_t] + eh[j_t]) * 0.5 - (pos[i_t, 1] - pos[j_t, 1]).abs()
+            keep   = ((ov_x_t > 0) & (ov_y_t > 0)).nonzero(as_tuple=True)[0]
+            sev_t  = torch.minimum(ov_x_t, ov_y_t)
+            pairs  = [(float(sev_t[k]), int(i_t[k]), int(j_t[k])) for k in keep.tolist()]
+
+    return _countOverlaps(pos, num_hard, phys_sizes, upper=upper)
 
 
 def bumpLegalize(pos, benchmark, halo_size=0.0, max_passes=80, margin_frac=5e-3,
@@ -309,7 +334,7 @@ def bumpLegalize(pos, benchmark, halo_size=0.0, max_passes=80, margin_frac=5e-3,
                   f"{status}", flush=True)
 
     # Phase 2: Gauss-Seidel cleanup for the small residual.
-    remaining_halo = len(_findOverlappingPairs(pos, num_hard, eff_sizes))
+    remaining_halo = len(_findOverlappingPairs(pos, num_hard, eff_sizes, upper=upper))
     if remaining_halo > 0:
         cleanup_margin = min_dim * 0.02
         if not quiet:
@@ -318,7 +343,7 @@ def bumpLegalize(pos, benchmark, halo_size=0.0, max_passes=80, margin_frac=5e-3,
         remaining_phys = _gaussSeidelCleanup(pos, num_hard, phys_sizes, eff_sizes,
                                               fixed, canvas_w, canvas_h, cleanup_margin)
     else:
-        remaining_phys = _countOverlaps(pos, num_hard, phys_sizes)
+        remaining_phys = _countOverlaps(pos, num_hard, phys_sizes, upper=upper)
 
     if remaining_phys > 0:
         if not quiet:

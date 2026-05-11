@@ -50,6 +50,7 @@ COMBOS: list[dict] = [
 
      #{"rotation_optimizer": "none"},
      #{"rotation_optimizer": "greedy", "n_placement_passes": 2},
+    #{"cGP_enable": "False"},
 ]
 
 SWEEP = {
@@ -87,20 +88,24 @@ SWEEP = {
     #"target_density": [0.55, 0.6, 0.65, 0.7, 0.75, 0.80, 0.85, 0.90],
     #"density_grid_size": [64, 96, 128, 192],
     #"target_density": [0.65],
-    #"halo_size": [ 0.2, 0.25, 0.3, 0.35],
-    #"soft_place": ["False", "True"],
-    #"halo_size": [ 0.3],
     #"halo_legalize": [0.1, 0.15],
     #"quad_scatter_fraction": [0, 0.1, 0.2, 0.3], # fraction of movable macros (ranked by area×net_degree) randomly scattered in stage 1 (0 = disabled)
     #"quad_scatter_lock_mult": [5, 10, 20, 50], # keep scatter macros fixed in mGP until lambda >= this × lambda_0
     #"mip_only": ["False", "True"], # skip mGP/cGP — legalize from mIP positions and return immediately (fast proxy for scatter quality)
 
-    "lambda_cong": [0.32], # congestion penalty weight (relative to density) in mGP
-    "lambda_cong_step": [ 1.01], # multiplicative increase of lambda_cong per mGP iteration (if >1, otherwise fixed)
+    #"lambda_cong": [0.32], # congestion penalty weight (relative to density) in mGP
+    #"lambda_cong_step": [ 1.01], # multiplicative increase of lambda_cong per mGP iteration (if >1, otherwise fixed)
     #"quad_scatter_fraction": [0, 0.1, 0.15, 0.2], # keep scatter macros fixed in mGP until lambda >= this × lambda_0
-    "quad_scatter_n": [0, 1, 2, 4, 8, 12, 15, 20],  # keep scatter macros fixed in mGP until lambda >= this × lambda_0
-    "seed": [999, 9999, 99999, 999999], # random seed for initial placement and mGP; affects all stochasticity when deterministic=false
-    "quad_scatter_lock_mult": [0, 1e3, 1e4, 1e6], # keep scatter macros fixed in mGP until lambda >= this × lambda_0
+    #"quad_scatter_n": [0, 1, 2, 4, 8, 12, 15, 20],  # keep scatter macros fixed in mGP until lambda >= this × lambda_0
+    #"quad_scatter_lock_mult": [0, 1e3, 1e4, 1e6], # keep scatter macros fixed in mGP until lambda >= this × lambda_0
+    #"n_placement_passes": [1, 2]
+
+    "cGP_enable": ["True"],
+    #"cGP_lambda_cong_init": [1e-4, 1e-3, 5e-3, 1e-2, 1.5e-2],
+    #"seed": [999, 9999, 99999, 999999, 888, 777, 666, 555], # random seed for initial placement and mGP; affects all stochasticity when deterministic=false
+    #"halo_size": [ 0.2, 0.25, 0.3, 0.35],
+    "lambda_density_init": [1e-7, 1e-6, 1e-5],
+    "cong_rudy_grid_size": [32, 64, 128],
 }
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -127,13 +132,16 @@ MASTER_CSV  = SWEEP_DIR / "results.csv"
 UV          = "/home/msears/.local/bin/uv"
 
 IBM_BENCHMARKS = [
-    "ibm01", "ibm02", "ibm03", "ibm04", "ibm06", "ibm07", "ibm08", "ibm09",
+
+    # Full set
+    #"ibm01", "ibm02", "ibm03", "ibm04", "ibm06", "ibm07", "ibm08", "ibm09",
     #"ibm10", "ibm11", "ibm12", "ibm13", "ibm14", "ibm15", "ibm16", "ibm17", "ibm18",
 
-    "ibm11", "ibm14", "ibm17",
-
-    # small+medium+large subset for quick testing
-    #"ibm01", "ibm04", "ibm14", # best avg for this subset: 1.3782
+    # Small subset
+    #"ibm01", "ibm04", "ibm14", # best avg for this subset: 1.3782 (new best, 1.2525)
+    
+    # Medium Subset
+    "ibm01", "ibm02",  "ibm04", "ibm07", "ibm11", "ibm14", "ibm17",
 ]
 
 METRIC_COLS = ["proxy", "wl", "den", "cong", "valid", "time_s", "mgp_iters", "cgp_iters", "overlaps"]
