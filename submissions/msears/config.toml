@@ -28,7 +28,7 @@ deterministic         = true            # force deterministic GPU ops; ~10-30% s
 gamma          = "auto"  # WA HPWL smoothness: "auto" (decay from canvas_diag/8), "ovfw" (overflow-driven, XPlace), or <float>
 gamma_decay    = 0.994   # multiply gamma by this each iteration
 gamma_min_frac = 0.00667 # gamma_min = canvas_diag * gamma_min_frac
-max_step       = "auto"  # max macro displacement per iter: "auto" (canvas_diag × 0.005) or <float>
+max_step       = 0.005   # max macro displacement per iter as fraction of canvas_diag; e.g. 0.005 → canvas_diag × 0.005
 
 # ── mGP convergence ───────────────────────────────────────────────────────
 stop_overflow      = 0.05   # Lgamma: stop when overflow_ratio < this AND wl rising
@@ -62,6 +62,7 @@ lambda_hm_decay = 0.995  # per-iter decay toward 1.0
 # ── mGP macro halos ───────────────────────────────────────────────────────
 halo_size     = 0.25   # inflate hard macro footprints in density map by this fraction (0 = disabled); e.g. 0.1 → (1.1w)×(1.1h), charge conserved via area_ratio
 halo_legalize = 0.1
+hard_macro_boundary_margin = 0.0  # keep hard macro edges this far from canvas boundary (fraction of canvas dim)
 
 # ── Phase 2.5: Hard-macro spread ──────────────────────────────────────────
 # After mGP convergence, remove soft macros and re-run so hard macros spread into whitespace.
@@ -84,10 +85,11 @@ n_placement_passes   = 2          # run full pipeline this many times, locking o
 
 # ── Phase 4: cGP — Cell Global Placement ──────────────────────────────────
 # Lock hard macros; re-run WL + density descent for soft macros only.
-cGP_enable           = false  # enable phase 4
+cGP_enable           = true # enable phase 4
 cGP_iters            = 5000   # max iterations (early stopping applies)
 cGP_position_reset   = false  # reset soft macros to canvas center before cGP
 cGP_lambda_cong_init = 0.0    # congestion gradient weight relative to HPWL (0 = disabled)
+cGP_hard_density     = true # include hard macros in density map during cGP (false = soft macros only)
 
 # ── Convergence checks (apply to both mGP and cGP) ────────────────────────
 # Disable individually to isolate their effect (all default true).
@@ -114,14 +116,14 @@ record_frames = true
 frames_dir    = "vis/frames"
 quiet         = false
 highlight_macros        = []  # specific macro names to highlight in GIF; takes priority over highlight_random_macros
-highlight_random_macros = 0   # randomly highlight N macros by area (used only when highlight_macros is empty)
-highlight_scatter_macros = 5  # highlight the top N scattered macros (by area) from scatter_ids.pt; used when highlight_macros is empty
+highlight_random_macros = 5   # randomly highlight N macros by area (used only when highlight_macros is empty)
+highlight_scatter_macros = 0  # highlight the top N scattered macros (by area) from scatter_ids.pt; used when highlight_macros is empty
 highlight_io_nets       = 0   # highlight nets connecting to fixed I/O ports (0 = all IO nets, null/omit = disabled)
 show_congestion_heatmap = true  # draw RUDY congestion heatmap as background (red = high demand)
 congestion_gif          = true  # also export a congestion-only heatmap GIF
-show_io_nets            = false # draw nets that connect to an I/O pad
-show_other_nets         = true # draw nets NOT connected to I/O pads
-show_hard_macros        = false # draw hard macros (steelblue)
+show_io_nets            = true # draw nets that connect to an I/O pad
+show_other_nets         = false # draw nets NOT connected to I/O pads
+show_hard_macros        = true # draw hard macros (steelblue)
 show_soft_macros        = true  # draw soft macros (mediumseagreen)
 legalization_details    = false  # print per-pass legalization progress lines (can be verbose)
 phase_banners           = true   # print a brief banner at the start and end of each placement phase

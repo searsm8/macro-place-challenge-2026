@@ -68,8 +68,6 @@ SWEEP = {
     #"center_init_spread": [0.15],
     #"density_weight": [1e-3],
     #"lambda_iters_per_update": [1, 3, 5],
-    #"hard_spread": ["False", "True"],
-    #"hard_spread_iters": [0, 50],
     #"curtailed_iters": [300, 500, 700, 900]
 
     #"stop_overflow": [0.03, 0.04, .05],
@@ -100,12 +98,16 @@ SWEEP = {
     #"quad_scatter_lock_mult": [0, 1e3, 1e4, 1e6], # keep scatter macros fixed in mGP until lambda >= this × lambda_0
     #"n_placement_passes": [1, 2]
 
-    "cGP_enable": ["True"],
+    #"cGP_enable": ["True"],
     #"cGP_lambda_cong_init": [1e-4, 1e-3, 5e-3, 1e-2, 1.5e-2],
     #"seed": [999, 9999, 99999, 999999, 888, 777, 666, 555], # random seed for initial placement and mGP; affects all stochasticity when deterministic=false
     #"halo_size": [ 0.2, 0.25, 0.3, 0.35],
-    "lambda_density_init": [1e-7, 1e-6, 1e-5],
-    "cong_rudy_grid_size": [32, 64, 128],
+    #"lambda_density_init": [1e-7, 1e-6, 1e-5],
+    #"cong_rudy_grid_size": [32, 64, 128],
+    #"max_step": [0.002, 0.0025, 0.003, 0.0035, 0.004],
+    #"hard_spread": ["False", "True"],
+    #"hard_spread_iters": [50, 100, 400],
+    "cGP_hard_density ": ["False", "True"],
 }
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -138,10 +140,10 @@ IBM_BENCHMARKS = [
     #"ibm10", "ibm11", "ibm12", "ibm13", "ibm14", "ibm15", "ibm16", "ibm17", "ibm18",
 
     # Small subset
-    #"ibm01", "ibm04", "ibm14", # best avg for this subset: 1.3782 (new best, 1.2525)
+    "ibm01", "ibm04", "ibm14", # best avg for this subset: 1.3782 (new best, 1.2525)
     
     # Medium Subset
-    "ibm01", "ibm02",  "ibm04", "ibm07", "ibm11", "ibm14", "ibm17",
+    #"ibm01", "ibm02",  "ibm04", "ibm07", "ibm11", "ibm14",
 ]
 
 METRIC_COLS = ["proxy", "wl", "den", "cong", "valid", "time_s", "mgp_iters", "cgp_iters", "overlaps"]

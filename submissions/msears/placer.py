@@ -434,7 +434,7 @@ class CometPlacer:
         else:
             self.gamma = float(gamma_cfg)
             self.gamma_mode = "decay"
-        self.max_step = None if p.get("max_step", "auto") == "auto" else float(p["max_step"])
+        self.max_step_frac = float(p.get("max_step", 0.005))
         self.gamma_decay = p.get("gamma_decay", 0.98)
         self.gamma_min_frac = p.get("gamma_min_frac", 1 / 150)
         self.gamma_iters_per_update = p.get("gamma_iters_per_update", 1)
@@ -445,10 +445,12 @@ class CometPlacer:
         self.cgp_enable = _asBool(p.get("cGP_enable", p.get("soft_place", False)))
         self.cgp_position_reset = _asBool(p.get("cGP_position_reset", False))
         self.cgp_lambda_cong_init = float(p.get("cGP_lambda_cong_init", 0.0))
+        self.cgp_hard_density = _asBool(p.get("cGP_hard_density", True))
         self.hard_spread = _asBool(p.get("hard_spread", False))
         self.hard_spread_iters = p.get("hard_spread_iters", 50)
         self.halo_size = float(p.get("halo_size", 0.0))
         self.halo_legalize = float(p.get("halo_legalize", self.halo_size))
+        self.hard_macro_boundary_margin = float(p.get("hard_macro_boundary_margin", 0.01))
         gs = p.get("density_grid_size", None)
         self.density_grid_rows = int(gs) if gs is not None else None
         self.density_grid_cols = int(gs) if gs is not None else None
@@ -992,11 +994,16 @@ class CometPlacer:
 
         half_w = benchmark.macro_sizes[:num_macros, 0].to(self.device) / 2
         half_h = benchmark.macro_sizes[:num_macros, 1].to(self.device) / 2
+        # Hard macros are fixed in cGP; no boundary margin needed.
+        cgp_clamp_lo_x = half_w
+        cgp_clamp_hi_x = canvas_w - half_w
+        cgp_clamp_lo_y = half_h
+        cgp_clamp_hi_y = canvas_h - half_h
 
         # Restart gamma and step size fresh for this phase
         gamma = canvas_diag / 8.0
         gamma_min = canvas_diag * self.gamma_min_frac
-        max_step = self.max_step or canvas_diag * 0.005
+        max_step = canvas_diag * self.max_step_frac
 
         state = {
             "num_macros": num_macros,
@@ -1009,6 +1016,10 @@ class CometPlacer:
             "fixed_mask": fixed_mask,
             "half_w": half_w,
             "half_h": half_h,
+            "clamp_lo_x": cgp_clamp_lo_x,
+            "clamp_hi_x": cgp_clamp_hi_x,
+            "clamp_lo_y": cgp_clamp_lo_y,
+            "clamp_hi_y": cgp_clamp_hi_y,
             "precond": self._buildPreconditioner(benchmark, net_data, num_macros),
             "pos": pos.clone(),
             "init_pos": pos.clone(),  # _clampPositions restores fixed macros to this
@@ -1016,6 +1027,7 @@ class CometPlacer:
             "lambda_cong_eff": 0.0,
             "lambda_hm": 1.0,         # no hard-macro boost; they're fixed anyway
             "hard_mask": benchmark.get_hard_macro_mask().to(self.device),
+            "density_mask": None if self.cgp_hard_density else ~benchmark.get_hard_macro_mask()[:num_macros].to(self.device),
             "best_wl": float("inf"),
             "best_pos": pos.clone(),
             "prev_wl": float("inf"),
@@ -1105,12 +1117,22 @@ class CometPlacer:
         canvas_diag = max(canvas_w, canvas_h)
 
         gamma = self.gamma or canvas_diag / 8.0
-        max_step = self.max_step or canvas_diag * 0.005
+        max_step = canvas_diag * self.max_step_frac
         gamma_min = canvas_diag * self.gamma_min_frac
 
         fixed_mask = benchmark.macro_fixed[:num_macros].to(self.device)
         half_w = benchmark.macro_sizes[:num_macros, 0].to(self.device) / 2
         half_h = benchmark.macro_sizes[:num_macros, 1].to(self.device) / 2
+
+        hm_margin_x = canvas_w * self.hard_macro_boundary_margin
+        hm_margin_y = canvas_h * self.hard_macro_boundary_margin
+        hm_mask_f = benchmark.get_hard_macro_mask()[:num_macros].float().to(self.device)
+        extra_x = hm_mask_f * hm_margin_x
+        extra_y = hm_mask_f * hm_margin_y
+        clamp_lo_x = half_w + extra_x
+        clamp_hi_x = canvas_w - half_w - extra_x
+        clamp_lo_y = half_h + extra_y
+        clamp_hi_y = canvas_h - half_h - extra_y
 
         precond = self._buildPreconditioner(benchmark, net_data, num_macros)
 
@@ -1141,6 +1163,10 @@ class CometPlacer:
             "fixed_mask": fixed_mask,
             "half_w": half_w,
             "half_h": half_h,
+            "clamp_lo_x": clamp_lo_x,
+            "clamp_hi_x": clamp_hi_x,
+            "clamp_lo_y": clamp_lo_y,
+            "clamp_hi_y": clamp_hi_y,
             "precond": precond,
             "pos": pos,
             "init_pos": init_pos,
@@ -1499,19 +1525,15 @@ class CometPlacer:
         u_kp1[state["fixed_mask"]] = state["init_pos"][state["fixed_mask"]]
         if state["active_lock_mask"] is not None:
             u_kp1[state["active_lock_mask"]] = state["init_pos"][state["active_lock_mask"]]
-        u_kp1[:, 0] = u_kp1[:, 0].clamp(
-            min=state["half_w"], max=state["canvas_w"] - state["half_w"])
-        u_kp1[:, 1] = u_kp1[:, 1].clamp(
-            min=state["half_h"], max=state["canvas_h"] - state["half_h"])
+        u_kp1[:, 0] = u_kp1[:, 0].clamp(min=state["clamp_lo_x"], max=state["clamp_hi_x"])
+        u_kp1[:, 1] = u_kp1[:, 1].clamp(min=state["clamp_lo_y"], max=state["clamp_hi_y"])
 
         v_kp1 = u_kp1 + coef * (u_kp1 - state["u_k"])
         v_kp1[state["fixed_mask"]] = state["init_pos"][state["fixed_mask"]]
         if state["active_lock_mask"] is not None:
             v_kp1[state["active_lock_mask"]] = state["init_pos"][state["active_lock_mask"]]
-        v_kp1[:, 0] = v_kp1[:, 0].clamp(
-            min=state["half_w"], max=state["canvas_w"] - state["half_w"])
-        v_kp1[:, 1] = v_kp1[:, 1].clamp(
-            min=state["half_h"], max=state["canvas_h"] - state["half_h"])
+        v_kp1[:, 0] = v_kp1[:, 0].clamp(min=state["clamp_lo_x"], max=state["clamp_hi_x"])
+        v_kp1[:, 1] = v_kp1[:, 1].clamp(min=state["clamp_lo_y"], max=state["clamp_hi_y"])
 
         state["u_k"] = u_kp1
         state["v_k"] = v_kp1
@@ -1521,9 +1543,9 @@ class CometPlacer:
     def _clampPositions(self, state):
         """Clamp positions to canvas bounds and restore fixed/locked macros."""
         state["pos"][:, 0] = state["pos"][:, 0].clamp(
-            min=state["half_w"], max=state["canvas_w"] - state["half_w"])
+            min=state["clamp_lo_x"], max=state["clamp_hi_x"])
         state["pos"][:, 1] = state["pos"][:, 1].clamp(
-            min=state["half_h"], max=state["canvas_h"] - state["half_h"])
+            min=state["clamp_lo_y"], max=state["clamp_hi_y"])
         state["pos"][state["fixed_mask"]] = state["init_pos"][state["fixed_mask"]]
         if state["active_lock_mask"] is not None:
             state["pos"][state["active_lock_mask"]] = state["init_pos"][state["active_lock_mask"]]
