@@ -96,18 +96,19 @@ SWEEP = {
     #"cong_start_overflow": [0.45], # overflow threshold below which congestion gradient activates (Xplace default: 0.2)
     #"lambda_cong_init": [0.3], # congestion penalty weight (relative to density) in mGP
 
-    "initial_placement": ["none", "center", "quadratic"],
+    #"initial_placement": ["none", "center", "quadratic"],
     #"halo_legalize": [0.1],
-    "halo_size": [ 0.2, 0.25, 0.3, 0.4, 0.5],
+    #"halo_size": [ 0.2, 0.25, 0.3, 0.4, 0.5],
     #"legalization": ["bump", "sa"],
-    "cGP_enable": ["True", "False"],
-    "mGP_hard_macro_density_weight": [1.0, 1.2, 1.4], # charge weight for hard macros in mGP density map (>1 = stronger repulsion)
-    "mGP_soft_macro_density_weight": [0.6, 0.8, 1.0], # charge weight for soft macros in mGP density map (<1 = weaker repulsion)
+    #"cGP_enable": ["True", "False"],
+    #"mGP_hard_macro_density_weight": [1.0, 1.2, 1.4], # charge weight for hard macros in mGP density map (>1 = stronger repulsion)
+    #"mGP_soft_macro_density_weight": [0.6, 0.8, 1.0], # charge weight for soft macros in mGP density map (<1 = weaker repulsion)
 
     #"quad_scatter_section_count": [8], # number of sections to divide macros into for quadrant scatter (0 = disabled; try powers of 4 up to num_movable_macros)
     #"quad_scatter_runs_per_section": [16], # number of mGP runs to perform per section in quadrant scatter (0 = disabled; try 1 or more for best results, especially with higher quad_scatter_section_count)
     #"mGP_hard_macro_density_weight": [ 1.2], # charge weight for hard macros in mGP density map (>1 = stronger repulsion)
     #"mGP_soft_macro_density_weight": [ 0.8], # charge weight for soft macros in mGP density map (<1 = weaker repulsion)
+    "ga_enable": ["True", "False"],
 }
 # ─────────────────────────────────────────────────────────────────────────────
 

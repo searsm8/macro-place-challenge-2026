@@ -110,6 +110,15 @@ conv_lambda_max  = true   # stop when lambda is pegged at ceiling AND overflow f
 conv_divergence  = true   # stop when wl > 5×best AND overflow trending up
 convergence_countdown = 30  # extra iters to run after convergence before stopping
 
+[ga]
+ga_enable  = false   # set true to run genetic algorithm over hyperparameters
+pop_size   = 16      # individuals per generation
+n_gens     = 5       # number of generations
+elite_k    = 2       # top-k individuals carried unchanged to next generation
+tourn_k    = 3       # tournament selection size
+mut_rate   = 0.25    # per-gene mutation probability
+seed       = 0       # RNG seed for GA (independent of placer seed)
+
 [congestion]
 cong_rudy_enable    = true   # compute RUDY congestion map after placement (diagnostic only for now)
 cong_rudy_grid_size = 64     # grid resolution (square); independent of density_grid_size

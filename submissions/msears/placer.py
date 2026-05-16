@@ -383,7 +383,18 @@ class CometPlacer:
     Each iteration combines two gradient signals:
       - WL gradient  : pulls macros toward net centroids (attractive)
       - Density grad : pushes macros from overcrowded bins (repulsive)
+
+    When config [ga] ga_enable = true, __new__ returns a GACometPlacer
+    instance instead, transparently routing through the GA.
     """
+
+    def __new__(cls, config: dict | None = None):
+        if cls is CometPlacer:
+            cfg = config if config is not None else _loadConfig()
+            if _asBool(cfg.get("ga", {}).get("ga_enable", False)):
+                ga_mod = _importSibling("ga_placer")
+                return ga_mod.GACometPlacer(config=cfg)
+        return super().__new__(cls)
 
     def __init__(self, config: dict | None = None):
         """
