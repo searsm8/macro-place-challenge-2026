@@ -11,6 +11,9 @@ Public API:
         Legacy greedy spiral push-out. Kept as a last-resort fallback.
 """
 
+import math
+import random
+import numpy as np
 import torch
 
 
@@ -352,6 +355,218 @@ def bumpLegalize(pos, benchmark, halo_size=0.0, max_passes=80, margin_frac=5e-3,
             if not quiet:
                 print(f"    legalize bump: falling back to spiral", flush=True)
             pos = spiralLegalize(pos, benchmark, max_passes=3, verbose=verbose, quiet=quiet)
+
+    return pos
+
+
+# ---------------------------------------------------------------------------
+# SA legalization — ePlace-MS Section VII
+# ---------------------------------------------------------------------------
+
+def saLegalize(pos, benchmark, net_data_cpu,
+               outer_iters=10, steps_per_macro=50, beta=1.5, quiet=False):
+    """
+    SA-based macro legalization (ePlace-MS Section VII).
+
+    Minimizes f(v) = HPWL(v) + mu_O * O_m(v) via two-level simulated annealing.
+    Only hard macros are moved; soft macros and ports are treated as fixed.
+
+    Outer loop j: escalates mu_O, temperature window, and motion radius by beta^j.
+    Inner loop k: linearly decays temperature from 3% to 0.01% cost acceptance.
+    Stops early when all hard-macro overlaps are eliminated.
+    """
+    pos = pos.clone()
+    num_hard = benchmark.num_hard_macros
+    if num_hard == 0:
+        return pos
+
+    sizes_t  = benchmark.macro_sizes          # [n_total, 2] tensor
+    sizes_np = sizes_t.numpy()                 # numpy view (read-only)
+    canvas_w = float(benchmark.canvas_width)
+    canvas_h = float(benchmark.canvas_height)
+    fixed_np = benchmark.macro_fixed[:num_hard].bool().numpy()
+
+    movable  = [i for i in range(num_hard) if not fixed_np[i]]
+    if not movable:
+        return pos
+    n_movable = len(movable)
+    k_max     = steps_per_macro * n_movable
+
+    # Precompute half-sizes for clamping and overlap (numpy)
+    hw = sizes_np[:num_hard, 0] * 0.5   # [num_hard]
+    hh = sizes_np[:num_hard, 1] * 0.5
+
+    # Zero-copy numpy view into pos (hard macros only)
+    pos_np = pos[:num_hard].numpy()
+
+    # ── Build net data structures ──────────────────────────────────────────
+    macro_ids_np = net_data_cpu["macro_ids"].numpy()   # [P]
+    offsets_np   = net_data_cpu["offsets"].numpy()     # [P, 2]
+    net_ids_np   = net_data_cpu["net_ids"].numpy()     # [P]
+    is_macro_np  = net_data_cpu["is_macro"].numpy()    # [P] bool
+    num_nets     = int(net_data_cpu["num_nets"])
+    num_soft     = benchmark.num_soft_macros
+    soft_pos_np  = pos[num_hard:].numpy() if num_soft > 0 else np.zeros((0, 2), np.float32)
+
+    # fixed_min/max per net: contributions from ports + soft macro pins
+    net_fixed_min = np.full((num_nets, 2),  np.inf, dtype=np.float64)
+    net_fixed_max = np.full((num_nets, 2), -np.inf, dtype=np.float64)
+
+    # Hard macro pins per net: collect then build CSR
+    hard_pin_tmp = [[] for _ in range(num_nets)]  # [(m, ox, oy), ...]
+
+    for p in range(len(macro_ids_np)):
+        k  = int(net_ids_np[p])
+        m  = int(macro_ids_np[p])
+        ox = float(offsets_np[p, 0])
+        oy = float(offsets_np[p, 1])
+
+        if bool(is_macro_np[p]):
+            if 0 <= m < num_hard:
+                hard_pin_tmp[k].append((m, ox, oy))
+            else:
+                sm = m - num_hard
+                if 0 <= sm < num_soft:
+                    px = float(soft_pos_np[sm, 0]) + ox
+                    py = float(soft_pos_np[sm, 1]) + oy
+                else:
+                    px, py = ox, oy
+                net_fixed_min[k] = np.minimum(net_fixed_min[k], [px, py])
+                net_fixed_max[k] = np.maximum(net_fixed_max[k], [px, py])
+        else:
+            # Port pin: offsets hold absolute position
+            net_fixed_min[k] = np.minimum(net_fixed_min[k], [ox, oy])
+            net_fixed_max[k] = np.maximum(net_fixed_max[k], [ox, oy])
+
+    # CSR storage for hard macro pins
+    counts = np.array([len(hard_pin_tmp[k]) for k in range(num_nets)], dtype=np.int32)
+    starts = np.zeros(num_nets + 1, dtype=np.int32)
+    starts[1:] = np.cumsum(counts)
+    total_hp = int(starts[-1])
+    hp_m  = np.empty(total_hp, dtype=np.int32)
+    hp_ox = np.empty(total_hp, dtype=np.float64)
+    hp_oy = np.empty(total_hp, dtype=np.float64)
+    for k in range(num_nets):
+        s = int(starts[k])
+        for i, (m, ox, oy) in enumerate(hard_pin_tmp[k]):
+            hp_m[s + i]  = m
+            hp_ox[s + i] = ox
+            hp_oy[s + i] = oy
+
+    # macro_to_nets: for each hard macro, sorted array of net indices it touches
+    macro_net_sets = [set() for _ in range(num_hard)]
+    for k in range(num_nets):
+        s, e = int(starts[k]), int(starts[k + 1])
+        for i in range(s, e):
+            macro_net_sets[int(hp_m[i])].add(k)
+    macro_to_nets = [np.array(sorted(s), dtype=np.int32) for s in macro_net_sets]
+
+    # ── Net HPWL helper ────────────────────────────────────────────────────
+    def _net_hpwl(k):
+        s, e = int(starts[k]), int(starts[k + 1])
+        fmin = net_fixed_min[k]
+        fmax = net_fixed_max[k]
+        if s < e:
+            m_sl  = hp_m[s:e]
+            px    = pos_np[m_sl, 0] + hp_ox[s:e]
+            py    = pos_np[m_sl, 1] + hp_oy[s:e]
+            min_x = min(float(fmin[0]), float(px.min()))
+            max_x = max(float(fmax[0]), float(px.max()))
+            min_y = min(float(fmin[1]), float(py.min()))
+            max_y = max(float(fmax[1]), float(py.max()))
+        else:
+            min_x, max_x = float(fmin[0]), float(fmax[0])
+            min_y, max_y = float(fmin[1]), float(fmax[1])
+        return max(0.0, max_x - min_x) + max(0.0, max_y - min_y)
+
+    # ── Overlap helpers ─────────────────────────────────────────────────────
+    def _overlap_with_m(m):
+        """Total pairwise overlap area of macro m with every other hard macro."""
+        dx   = np.abs(pos_np[:, 0] - pos_np[m, 0])
+        dy   = np.abs(pos_np[:, 1] - pos_np[m, 1])
+        ov_x = hw[m] + hw - dx
+        ov_y = hh[m] + hh - dy
+        ov   = np.maximum(0.0, ov_x) * np.maximum(0.0, ov_y)
+        ov[m] = 0.0
+        return float(ov.sum())
+
+    def _total_overlap_count():
+        """Count pairs with non-zero physical overlap."""
+        upper = torch.triu(torch.ones(num_hard, num_hard, dtype=torch.bool), diagonal=1)
+        return _countOverlaps(pos, num_hard, sizes_t, upper=upper)
+
+    # ── Initialise cost ─────────────────────────────────────────────────────
+    net_hpwl_arr = np.array([_net_hpwl(k) for k in range(num_nets)], dtype=np.float64)
+    total_hpwl   = float(net_hpwl_arr.sum())
+
+    total_overlap = sum(
+        _overlap_with_m(m) for m in range(num_hard)
+    ) * 0.5   # each pair counted twice
+
+    mu_O = (total_hpwl / total_overlap) if total_overlap > 1e-10 else total_hpwl
+
+    m_sqrt = math.sqrt(n_movable)
+
+    # ── Two-level SA loop ───────────────────────────────────────────────────
+    for j in range(outer_iters):
+        beta_j       = beta ** j
+        df_max_start = 0.03   * beta_j
+        df_max_end   = 0.0001 * beta_j
+        r_j          = (canvas_w / m_sqrt) * 0.05 * beta_j
+
+        for k in range(k_max):
+            alpha  = k / max(k_max - 1, 1)
+            df_max = df_max_start * (1.0 - alpha) + df_max_end * alpha
+            t      = df_max / math.log(2.0)
+
+            m_idx  = movable[random.randrange(n_movable)]
+            dx     = random.uniform(-r_j, r_j)
+            dy     = random.uniform(-r_j, r_j)
+
+            old_cx = float(pos_np[m_idx, 0])
+            old_cy = float(pos_np[m_idx, 1])
+            new_cx = max(hw[m_idx], min(canvas_w - hw[m_idx], old_cx + dx))
+            new_cy = max(hh[m_idx], min(canvas_h - hh[m_idx], old_cy + dy))
+            if new_cx == old_cx and new_cy == old_cy:
+                continue
+
+            old_ovlp_m = _overlap_with_m(m_idx)
+
+            # Move, evaluate, store new net HWPLs
+            pos_np[m_idx, 0] = new_cx
+            pos_np[m_idx, 1] = new_cy
+
+            affected   = macro_to_nets[m_idx]
+            new_hpwls  = np.empty(len(affected), dtype=np.float64)
+            delta_hpwl = 0.0
+            for i_net, k_net in enumerate(affected):
+                h             = _net_hpwl(int(k_net))
+                new_hpwls[i_net] = h
+                delta_hpwl   += h - float(net_hpwl_arr[k_net])
+
+            new_ovlp_m    = _overlap_with_m(m_idx)
+            delta_overlap = new_ovlp_m - old_ovlp_m
+            delta_f       = delta_hpwl + mu_O * delta_overlap
+
+            if delta_f <= 0.0 or random.random() < math.exp(-delta_f / t):
+                for i_net, k_net in enumerate(affected):
+                    net_hpwl_arr[k_net] = new_hpwls[i_net]
+                total_hpwl   += delta_hpwl
+                total_overlap = max(0.0, total_overlap + delta_overlap)
+            else:
+                pos_np[m_idx, 0] = old_cx
+                pos_np[m_idx, 1] = old_cy
+
+        mu_O *= beta
+
+        n_pairs = _total_overlap_count()
+        if not quiet:
+            print(f"    legalize SA j={j}: overlap_pairs={n_pairs}, "
+                  f"total_overlap={total_overlap:.3f}, hpwl={total_hpwl:.3f}", flush=True)
+        if n_pairs == 0:
+            if not quiet:
+                print(f"    legalize SA: clean after {j + 1} outer iteration(s)", flush=True)
+            break
 
     return pos
 

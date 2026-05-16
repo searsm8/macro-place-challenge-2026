@@ -276,8 +276,12 @@ def load_benchmark_for_frames(benchmark_name):
 
 
 def render_congestion_frame(frame_data, benchmark, net_edges, save_path, dpi,
-                             rudy_vmax=None):
-    """Render a congestion-only heatmap frame (no macros or nets)."""
+                             rudy_vmax=None, overflow_mode=False):
+    """Render a congestion-only heatmap frame (no macros or nets).
+
+    overflow_mode=True: display (rudy - mean).clamp(min=0) — only over-capacity bins.
+    overflow_mode=False: display raw RUDY demand.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -301,15 +305,24 @@ def render_congestion_frame(frame_data, benchmark, net_edges, save_path, dpi,
         canvas_w, canvas_h,
         benchmark.grid_rows, benchmark.grid_cols,
     )
-    rudy_np = rudy.cpu().numpy()
-    vmax = rudy_vmax if rudy_vmax is not None else (float(np.percentile(rudy_np, 99)) or 1e-6)
+    if overflow_mode:
+        display = (rudy - rudy.mean()).clamp(min=0.0)
+        cbar_label = "congestion overflow (demand − capacity)"
+        title_tag  = "congestion overflow"
+    else:
+        display = rudy
+        cbar_label = "routing demand"
+        title_tag  = "RUDY congestion"
+
+    display_np = display.cpu().numpy()
+    vmax = rudy_vmax if rudy_vmax is not None else (float(np.percentile(display_np, 99)) or 1e-6)
 
     fig, ax = plt.subplots(figsize=(8, 8))
     ax.set_xlim(0, canvas_w)
     ax.set_ylim(0, canvas_h)
     ax.set_aspect("equal")
     im = ax.imshow(
-        rudy_np,
+        display_np,
         origin="lower",
         extent=[0, canvas_w, 0, canvas_h],
         cmap="Reds",
@@ -317,8 +330,8 @@ def render_congestion_frame(frame_data, benchmark, net_edges, save_path, dpi,
         vmax=vmax,
         aspect="auto",
     )
-    fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02, label="routing demand")
-    ax.set_title(f"{name}  |  iter {iteration:4d}   RUDY congestion", fontsize=9)
+    fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02, label=cbar_label)
+    ax.set_title(f"{name}  |  iter {iteration:4d}   {title_tag}", fontsize=9)
     ax.tick_params(labelsize=7, labelbottom=False, labelleft=False)
     if phase:
         ax.text(0.98, -0.02, f"Phase {phase}", transform=ax.transAxes,
@@ -653,8 +666,9 @@ def main():
         io_nets = _io_net_ids(net_edges, max_count=n_io)
         print(f"  IO nets   : {len(io_nets)} highlighted  (limit={n_io or 'all'})")
 
-    # -- Compute locked congestion scale from first available frame ------------
+    # -- Compute locked congestion scales from first/last available frame ------
     rudy_vmax = None
+    ovfw_vmax = None
     if make_congestion_gif and net_edges is not None:
         import sys as _sys
         repo_root = Path(__file__).resolve().parent.parent
@@ -664,13 +678,23 @@ def main():
         import congestion as _cong
         first_frames = build_ordered_frames(frames_root, step=args.step, fps=args.fps)
         if first_frames:
+            # Raw demand: lock from first frame (demand highest when macros are spread), 4× headroom
             fd0 = first_frames[0][0]
             rudy0 = _cong.compute_rudy_map(
                 fd0["positions"], net_edges,
                 fd0["canvas_width"], fd0["canvas_height"],
                 benchmark.grid_rows, benchmark.grid_cols,
             )
-            rudy_vmax = (float(np.percentile(rudy0.cpu().numpy(), 99)) or 1e-6) * 2.0
+            rudy_vmax = (float(np.percentile(rudy0.cpu().numpy(), 99)) or 1e-6) * 4.0
+            # Overflow: lock from last frame (overflow grows as macros concentrate)
+            fdN = first_frames[-1][0]
+            rudyN = _cong.compute_rudy_map(
+                fdN["positions"], net_edges,
+                fdN["canvas_width"], fdN["canvas_height"],
+                benchmark.grid_rows, benchmark.grid_cols,
+            )
+            ovfw_np = (rudyN - rudyN.mean()).clamp(min=0.0).cpu().numpy()
+            ovfw_vmax = (float(np.percentile(ovfw_np, 99)) or 1e-6) * 2.0
 
     # --mip-only: render just the mIP (quadratic-init) PNG and exit
     if args.mip_only:
@@ -817,6 +841,37 @@ def main():
         )
         size_kb = cong_gif_path.stat().st_size / 1024
         print(f"  Saved congestion GIF: {cong_gif_path}  ({size_kb:.0f} KB)")
+
+        # -- Congestion overflow GIF (demand − capacity, clamped ≥ 0) --------
+        ovfw_gif_path = output_path.with_name(
+            output_path.stem.replace("_opt", "") + "_congestion_overflow.gif"
+        )
+        print(f"  Rendering congestion overflow GIF...", end=" ", flush=True)
+        ovfw_frames = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i, (frame_data, dur) in enumerate(ordered):
+                png_path = Path(tmpdir) / f"ovfw_{i:05d}.png"
+                render_congestion_frame(frame_data, benchmark, net_edges,
+                                        str(png_path), args.dpi,
+                                        rudy_vmax=ovfw_vmax,
+                                        overflow_mode=True)
+                ovfw_frames.append((Image.open(png_path).copy(), dur))
+                pct = (i + 1) / n_frames * 100
+                bar = "#" * int(pct / 2)
+                print(f"\r  Rendering congestion overflow GIF [{bar:<50}] {pct:5.1f}%",
+                      end="", flush=True)
+        print()
+        imgs, durs = zip(*ovfw_frames)
+        imgs[0].save(
+            ovfw_gif_path,
+            save_all=True,
+            append_images=list(imgs[1:]),
+            duration=list(durs),
+            loop=0,
+            optimize=False,
+        )
+        size_kb = ovfw_gif_path.stat().st_size / 1024
+        print(f"  Saved congestion overflow GIF: {ovfw_gif_path}  ({size_kb:.0f} KB)")
 
 
 if __name__ == "__main__":

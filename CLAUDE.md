@@ -158,7 +158,7 @@ Mix of hard and soft. ariane133: 133 hard + 782 soft macros.
 ## Current results (ibm01)
 ```
 # Pre-legalization greedy rotation, all 8 orientations, macro_sizes swap (current best):
-proxy≈0.99  (0 overlaps)
+proxy≈0.898  (0 overlaps)
 ```
 
 ## All-benchmark results (best config, 17 IBM benchmarks)
@@ -171,11 +171,11 @@ Status: QUALIFIED (0 overlaps). ibm01 improved from ~1.04 to ~0.99 with rotation
 ## Best results per benchmark (valid runs only, 0 overlaps)
 
 These are the best proxy scores observed across all sweeps (including random seeds).
-Updated: 2026-05-04.
+Updated: 2026-05-16.
 
 | benchmark | proxy  | wl     | density | congestion | sweep / run                        |
 |-----------|--------|--------|---------|------------|------------------------------------|
-| ibm01     | 0.9147 | 0.0713 | 0.5466  | 1.1400     | sweep_20260504T142134Z / run_038   |
+| ibm01     | 0.8981 | 0.0680 | 0.5510  | 1.1090     | sweep_20260516T025405Z / run_001   |
 | ibm02     | 1.3195 | 0.0984 | 0.5927  | 1.8495     | sweep_20260504T142134Z / run_042   |
 | ibm03     | 1.2021 | 0.1121 | 0.5470  | 1.6329     | sweep_20260502T002144Z / run_019   |
 | ibm04     | 1.1467 | 0.0921 | 0.5483  | 1.5610     | sweep_20260504T142134Z / run_043   |

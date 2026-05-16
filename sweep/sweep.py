@@ -8,7 +8,6 @@ Directory layout
 ----------------
 sweep/
   sweep.py                  ← this script
-  results.csv               ← master CSV (all sweeps appended here)
   sweep_<timestamp>/        ← one directory per sweep invocation
     results.csv             ← per-sweep CSV
     <benchmark>/
@@ -46,70 +45,85 @@ COMBOS: list[dict] = [
      #{"mgp_enable": "true",  "legalization": "bump"},
      #{"mgp_enable": "false", "legalization": "none"},
      #{"initial_placement": "none"},
-     #{"initial_placement": "center"},
 
-     #{"rotation_optimizer": "none"},
-     #{"rotation_optimizer": "greedy", "n_placement_passes": 2},
-    #{"cGP_enable": "False"},
+     #{"rotation_optimizer": "greedy", "initial_placement": "center"},
+     #{"rotation_optimizer": "greedy", "initial_placement": "none"},
+     #{"rotation_optimizer": "greedy", "initial_placement": "quadratic"},
+     #{"rotation_optimizer": "none", "initial_placement": "quadratic"},
+     #{"rotation_optimizer": "none", "initial_placement": "none"},
 ]
 
 SWEEP = {
-    #"initial_spread": [0.01, 0.04, 0.15],
-    #"warmup_iters": [0, 1, 10, 20, 40],
-    #"optimizer": ["sgd", "bb_sgd", "nesterov"],
-
-    #"lambda_pcof_upper": [1.03, 1.05],
-    #"lambda_hm_init": [1, 2, 3, 5, 10, 20], #(4/23) 1 is best (disabled density boost)
-    #"soft_place_iters": [1000, 3000, 5000],
-    #"lambda_max": [25000],
-    #"initial_placement": ["none", "center", "quadratic"],
-    #"initial_placement": ["none", "quadratic"],
-    #"initial_placement": ["center"],
-    #"center_init_spread": [0.15],
-    #"density_weight": [1e-3],
-    #"lambda_iters_per_update": [1, 3, 5],
-    #"curtailed_iters": [300, 500, 700, 900]
-
-    #"stop_overflow": [0.03, 0.04, .05],
-    #"rotation_optimizer": ["none", "greedy"],
-    #"use_gpu": ["False", "True"],
-    #"deterministic": ["False","False","True","True"],
-    #"n_placement_passes": [1, 2, 3],
-    #"rotation_candidates": ["all", "no-swap"],
-    #"gamma_decay": [0.991, 0.992, 0.993, 0.994],
-    #"gamma": ["auto", "ovfw"],
-
-    #"quad_b2b_iters": [0, 1, 3, 6],     
-    #"quad_net_size_threshold": [20, 80, 150],
-    #"quad_anchor_fraction": [ 0, .1, .2, 0.97], # fraction of movable macros (ranked by area×net_degree) fixed as internal anchors in stage 1 (0 = disabled)
-    #"density_grid_size": [75, 128, 256, 512],
-    #"target_density": [0.55, 0.6, 0.65, 0.7, 0.75, 0.80, 0.85, 0.90],
-    #"density_grid_size": [64, 96, 128, 192],
-    #"target_density": [0.65],
-    #"halo_legalize": [0.1, 0.15],
-    #"quad_scatter_fraction": [0, 0.1, 0.2, 0.3], # fraction of movable macros (ranked by area×net_degree) randomly scattered in stage 1 (0 = disabled)
-    #"quad_scatter_lock_mult": [5, 10, 20, 50], # keep scatter macros fixed in mGP until lambda >= this × lambda_0
-    #"mip_only": ["False", "True"], # skip mGP/cGP — legalize from mIP positions and return immediately (fast proxy for scatter quality)
-
-    #"lambda_cong": [0.32], # congestion penalty weight (relative to density) in mGP
-    #"lambda_cong_step": [ 1.01], # multiplicative increase of lambda_cong per mGP iteration (if >1, otherwise fixed)
-    #"quad_scatter_fraction": [0, 0.1, 0.15, 0.2], # keep scatter macros fixed in mGP until lambda >= this × lambda_0
-    #"quad_scatter_n": [0, 1, 2, 4, 8, 12, 15, 20],  # keep scatter macros fixed in mGP until lambda >= this × lambda_0
-    #"quad_scatter_lock_mult": [0, 1e3, 1e4, 1e6], # keep scatter macros fixed in mGP until lambda >= this × lambda_0
-    #"n_placement_passes": [1, 2]
 
     #"cGP_enable": ["True"],
     #"cGP_lambda_cong_init": [1e-4, 1e-3, 5e-3, 1e-2, 1.5e-2],
-    #"seed": [999, 9999, 99999, 999999, 888, 777, 666, 555], # random seed for initial placement and mGP; affects all stochasticity when deterministic=false
-    #"halo_size": [ 0.2, 0.25, 0.3, 0.35],
-    #"lambda_density_init": [1e-7, 1e-6, 1e-5],
     #"cong_rudy_grid_size": [32, 64, 128],
     #"max_step": [0.002, 0.0025, 0.003, 0.0035, 0.004],
     #"hard_spread": ["False", "True"],
     #"hard_spread_iters": [50, 100, 400],
-    "cGP_hard_density ": ["False", "True"],
+    #"lambda_cong_schedule": ["hpwl"],
+    #"lambda_den_iters_per_update": [1, 2, 3],
+    #"cGP_hard_macro_density_weight": [0.8, 1, 1.2, 1.4],
+    #"optimizer": ["sgd", "bb_sgd", "nesterov"],
+    #"quad_scatter_fraction": [0, 0.1], # fraction of movable macros (ranked by area×net_degree) randomly scattered in stage 1 (0 = disabled)
+    #"quad_scatter_lock_mult": [5, 10, 20, 50], # keep scatter macros fixed in mGP until lambda >= this × lambda_0
+    #"quad_scatter_lock_mult": [0, 1e3, 1e4, 1e6], # keep scatter macros fixed in mGP until lambda >= this × lambda_0
+    #"seed": [0, 1, 2, 3, 4, 5, 6, 7, 8, 999, 9999, 99999, 999999, 888, 777, 666, 555], # random seed for initial placement and mGP; affects all stochasticity when deterministic=false
+
+    #"cGP_enable": ["True", "False"],
+    #"n_placement_passes": [1, 2],
+    #"lambda_cong_step": [1.01],
+    #"quad_scatter_fraction": [0.15],
+    #"quad_scatter_lock_mult": [1000.0],
+    #"max_step": [0.002, 0.004, 0.005, 0.007],
+    #"halo_size": [ 0.2, 0.25, 0.3, 0.4, 0.5],
+    #"lambda_den_init": [0, 1e-7,1e-6, 1e-5, 1e-4],
+    #"lambda_den_init": [0],
+
+    #"rotation_optimizer": ["none", "greedy"],
+    #"n_placement_passes": [1, 2, 3],
+
+    #"rotation_optimizer": ["greedy"],
+    #"initial_placement": [ "center"],
+    #"center_init_spread": [0.01, 0.02, 0.05, 0.1], # fraction of canvas area for center-scatter radius (only used when initial_placement = "center")
+    #"max_step": [0.002, 0.003, 0.004, 0.005], # max movement per iteration as fraction of canvas diagonal; smaller = more conservative, slower convergence, but potentially better final proxy"
+
+    #"lambda_den_pcof_lower": [0.95, 0.98, 1.0, 1.01], # lower bound on per-constraint density penalty coefficient (relative to lambda_den) in mGP; higher = more uniform macro spreading
+    #"cong_start_overflow": [0, 0.2], # overflow threshold below which congestion gradient activates (Xplace default: 0.2)
+    #"lambda_cong_init": [0, 0.1, 0.2, 0.32, 0.5], # congestion penalty weight (relative to density) in mGP
+    #"quad_scatter_fraction": [0.1],
+    #"seed": [0,1,2,3,4,5,6,7,8,9,10,42, 88, 99999],
+    #"cong_start_overflow": [0.45], # overflow threshold below which congestion gradient activates (Xplace default: 0.2)
+    #"lambda_cong_init": [0.3], # congestion penalty weight (relative to density) in mGP
+
+    "initial_placement": ["none", "center", "quadratic"],
+    #"halo_legalize": [0.1],
+    "halo_size": [ 0.2, 0.25, 0.3, 0.4, 0.5],
+    #"legalization": ["bump", "sa"],
+    "cGP_enable": ["True", "False"],
+    "mGP_hard_macro_density_weight": [1.0, 1.2, 1.4], # charge weight for hard macros in mGP density map (>1 = stronger repulsion)
+    "mGP_soft_macro_density_weight": [0.6, 0.8, 1.0], # charge weight for soft macros in mGP density map (<1 = weaker repulsion)
+
+    #"quad_scatter_section_count": [8], # number of sections to divide macros into for quadrant scatter (0 = disabled; try powers of 4 up to num_movable_macros)
+    #"quad_scatter_runs_per_section": [16], # number of mGP runs to perform per section in quadrant scatter (0 = disabled; try 1 or more for best results, especially with higher quad_scatter_section_count)
+    #"mGP_hard_macro_density_weight": [ 1.2], # charge weight for hard macros in mGP density map (>1 = stronger repulsion)
+    #"mGP_soft_macro_density_weight": [ 0.8], # charge weight for soft macros in mGP density map (<1 = weaker repulsion)
 }
 # ─────────────────────────────────────────────────────────────────────────────
+
+IBM_BENCHMARKS = [
+
+    # Full set
+    "ibm01", "ibm02", "ibm03", "ibm04", "ibm06", "ibm07", "ibm08", "ibm09",
+    "ibm10", "ibm11", "ibm12", "ibm13", "ibm14", "ibm15", "ibm16", "ibm17", "ibm18",
+
+    
+    # Medium Subset
+    #"ibm01", "ibm02",  "ibm04", "ibm07", "ibm11", "ibm14",
+
+    # Small set
+    #"ibm01", "ibm4, "ibm14", # best avg for this subset: 1.3782 (new best, 1.2525)
+]
 
 import argparse
 import csv
@@ -125,26 +139,30 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
+
+def _git_commit(repo_root: Path) -> str:
+    """Return 'sha  subject' for HEAD, or 'unknown' on failure."""
+    try:
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo_root, text=True
+        ).strip()
+        subject = subprocess.check_output(
+            ["git", "log", "-1", "--format=%s"], cwd=repo_root, text=True
+        ).strip()
+        dirty = subprocess.check_output(
+            ["git", "status", "--porcelain"], cwd=repo_root, text=True
+        ).strip()
+        tag = f"{sha[:12]}  {subject}" + ("  [dirty]" if dirty else "")
+        return tag
+    except Exception:
+        return "unknown"
+
 # ── Paths ─────────────────────────────────────────────────────────────────────
 REPO_ROOT   = Path(__file__).parent.parent
 SUBMISSION_DIR = REPO_ROOT / "submissions/msears"
 CONFIG_PATH = REPO_ROOT / SUBMISSION_DIR / "config.toml"
 SWEEP_DIR   = Path(__file__).parent          # …/sweep/
-MASTER_CSV  = SWEEP_DIR / "results.csv"
 UV          = "/home/msears/.local/bin/uv"
-
-IBM_BENCHMARKS = [
-
-    # Full set
-    #"ibm01", "ibm02", "ibm03", "ibm04", "ibm06", "ibm07", "ibm08", "ibm09",
-    #"ibm10", "ibm11", "ibm12", "ibm13", "ibm14", "ibm15", "ibm16", "ibm17", "ibm18",
-
-    # Small subset
-    "ibm01", "ibm04", "ibm14", # best avg for this subset: 1.3782 (new best, 1.2525)
-    
-    # Medium Subset
-    #"ibm01", "ibm02",  "ibm04", "ibm07", "ibm11", "ibm14",
-]
 
 METRIC_COLS = ["proxy", "wl", "den", "cong", "valid", "time_s", "mgp_iters", "cgp_iters", "overlaps"]
 
@@ -246,11 +264,14 @@ def write_run_summary(
     combo_id: int,
     sweep_params: dict,
     result: dict | None,
+    commit: str = "",
 ):
     lines = [
         f"# Run {combo_id:03d} — {benchmark}\n\n",
         f"**Sweep params:** `{sweep_params}`\n\n",
     ]
+    if commit:
+        lines.append(f"**Commit:** `{commit}`\n\n")
 
     if result and result["proxy"] is not None:
         lines += [
@@ -282,8 +303,6 @@ def _sweep_csv_columns(sweep_keys: list) -> list:
         + ["sweep_id"]
     )
 
-
-MASTER_CSV_COLUMNS = ["combo_id", "benchmark"] + METRIC_COLS + ["sweep_id"]
 
 
 def _build_csv_row(
@@ -323,14 +342,13 @@ def run_one(
     original_config: str,
     quiet: bool,
     record_frames: bool,
-    render_gifs: bool,
+    commit: str = "",
 ) -> dict | None:
     """Execute one (config combo × benchmark) job.
 
     1. Writes patched config to run_dir/config.toml
     2. Invokes the evaluator with MSPLACER_CONFIG pointing at that file
        - If record_frames: frames saved to run_dir/frames/
-       - If render_gifs:   GIF rendered to run_dir/placement.gif after the run
     3. Parses stdout, writes run_summary.md
     4. Returns a result dict (or None on failure)
     """
@@ -369,6 +387,7 @@ def run_one(
     write_run_summary(
         run_dir / "run_summary.md",
         benchmark, combo_id, sweep_params, result,
+        commit=commit,
     )
 
     label = "  ".join(f"{k}={v}" for k, v in sweep_params.items())
@@ -380,21 +399,6 @@ def run_one(
     else:
         status = f"[FAILED]  ({elapsed:.1f}s)"
     print(f"  [{combo_id:03d}] {benchmark:<8}  {label}  →  {status}")
-
-    # Render GIF if frames were recorded
-    if record_frames and render_gifs:
-        gif_path = run_dir / "placement.gif"
-        gif_cmd  = [
-            UV, "run", "python",
-            str(REPO_ROOT / "scripts/frames_to_gif.py"),
-            "--benchmark",  benchmark,
-            "--frames-dir", str((run_dir / "frames").resolve()),
-            "--output",     str(gif_path.resolve()),
-            "--step",       "10", # use every 10th frame to speed up rendering
-        ]
-        subprocess.run(gif_cmd, capture_output=True, cwd=str(REPO_ROOT))
-        if gif_path.exists():
-            print(f"  [{combo_id:03d}] {benchmark:<8}  GIF → {gif_path.relative_to(REPO_ROOT)}")
 
     return result
 
@@ -417,6 +421,8 @@ def parse_args():
                    help="Render a placement.gif for each run after it completes")
     p.add_argument("--workers", type=int, default=8,
                    help="Number of parallel workers (default: 8)")
+    p.add_argument("--sequential", action="store_true",
+                   help="Run one job at a time (forces --workers 1); keeps runtime accurate")
     p.add_argument("--keep-best", action="store_true",
                    help="Write the best config to submissions/msears/config.toml")
     return p.parse_args()
@@ -453,10 +459,18 @@ def main():
     sweep_run_dir = SWEEP_DIR / f"sweep_{ts}"
     sweep_run_dir.mkdir(parents=True, exist_ok=True)
 
+    commit = _git_commit(REPO_ROOT)
+    (sweep_run_dir / "sweep_info.md").write_text(
+        f"# Sweep {ts}\n\n"
+        f"**commit:** `{commit}`\n\n"
+        f"**benchmarks:** {benchmarks}\n\n"
+        f"**combos:** {n_combos}\n"
+    )
+
     n_jobs = n_combos * len(benchmarks)
     print(f"Sweep : {n_combos} combo(s) × {len(benchmarks)} benchmark(s) = {n_jobs} jobs")
+    print(f"Commit : {commit}")
     print(f"Output : {sweep_run_dir.relative_to(REPO_ROOT)}")
-    print(f"Master : {MASTER_CSV.relative_to(REPO_ROOT)}")
     print()
 
     # Build job list: benchmark-outer so all combos for one benchmark run before
@@ -472,14 +486,13 @@ def main():
 
     record_frames = args.record_frames
     render_gifs   = args.render_gifs
-    n_workers     = min(args.workers, n_jobs) if n_jobs > 0 else 1
+    n_workers     = 1 if args.sequential else (min(args.workers, n_jobs) if n_jobs > 0 else 1)
 
-    # Initialise both CSVs with headers before the loop so partial results are
+    # Initialise sweep CSV with headers before the loop so partial results are
     # written immediately after each run (safe to interrupt mid-sweep).
     sweep_csv      = sweep_run_dir / "results.csv"
     sweep_csv_cols = _sweep_csv_columns(sweep_keys)
-    write_csv(sweep_csv,  [], sweep_csv_cols,      append=False)
-    write_csv(MASTER_CSV, [], MASTER_CSV_COLUMNS,  append=True)
+    write_csv(sweep_csv, [], sweep_csv_cols, append=False)
 
     csv_lock = threading.Lock()
     print(f"Workers: {n_workers}")
@@ -492,12 +505,12 @@ def main():
                     run_one,
                     run_dir, bm, combo_id, params,
                     original_config, args.quiet,
-                    record_frames, render_gifs,
+                    record_frames, commit,
                 )
-                futures[fut] = (combo_id, params)
+                futures[fut] = (combo_id, params, run_dir, bm)
 
         for fut in as_completed(futures):
-            combo_id, params = futures[fut]
+            combo_id, params, run_dir, benchmark = futures[fut]
             try:
                 result = fut.result()
             except Exception as exc:
@@ -507,16 +520,34 @@ def main():
                 collected.append((combo_id, params, result))
                 row = _build_csv_row(ts, combo_id, params, result)
                 with csv_lock:
-                    write_csv(sweep_csv,  [row], sweep_csv_cols,     append=True)
-                    write_csv(MASTER_CSV, [row], MASTER_CSV_COLUMNS, append=True)
+                    write_csv(sweep_csv, [row], sweep_csv_cols, append=True)
 
-    # ── CSV paths already written incrementally; just print locations ─────────
-    print(f"\nSweep CSV : {sweep_csv.relative_to(REPO_ROOT)}")
-    print(f"Master CSV: {MASTER_CSV.relative_to(REPO_ROOT)}")
+            if record_frames and render_gifs:
+                gif_path = run_dir / "placement.gif"
+                gif_cmd  = [
+                    UV, "run", "python",
+                    str(REPO_ROOT / "scripts/frames_to_gif.py"),
+                    "--benchmark",  benchmark,
+                    "--frames-dir", str((run_dir / "frames").resolve()),
+                    "--output",     str(gif_path.resolve()),
+                    "--step",       "10",
+                ]
+                subprocess.run(gif_cmd, capture_output=True, cwd=str(REPO_ROOT))
+                if gif_path.exists():
+                    print(f"  [{combo_id:03d}] {benchmark:<8}  GIF → {gif_path.relative_to(REPO_ROOT)}")
 
-    # ── Ranked summary ────────────────────────────────────────────────────────
+    # ── Build end-of-sweep output, print it, and append to sweep_info.md ────────
+    out_lines = [
+        f"\nSweep CSV : {sweep_csv.relative_to(REPO_ROOT)}",
+    ]
+
     if not collected:
-        print("\nNo results collected.")
+        out_lines.append("\nNo results collected.")
+        print("\n".join(out_lines))
+        with open(sweep_run_dir / "sweep_info.md", "a") as f:
+            f.write("\n## Console Output\n\n```\n")
+            f.write("\n".join(out_lines))
+            f.write("\n```\n")
         return
 
     combo_proxies: dict[int, list[float]] = defaultdict(list)
@@ -534,25 +565,46 @@ def main():
         key=lambda x: x[1],
     )
 
-    if not ranked:
-        return
+    if ranked:
+        width  = max(
+            len("  ".join(f"{k}={v}" for k, v in p.items())) for *_, p in ranked
+        )
+        sep    = "─" * (width + 34)
+        header = f"{'rank':<6}{'avg_proxy':<12}{'n_bench':<9}  params"
+        out_lines += ["", sep, header, sep]
+        for rank, (cid, ap, nb, params) in enumerate(ranked, 1):
+            label  = "  ".join(f"{k}={v}" for k, v in params.items())
+            marker = "  ← best" if rank == 1 else ""
+            out_lines.append(f"{rank:<6}{ap:<12.4f}{nb:<9}  {label}{marker}")
+        out_lines.append(sep)
 
-    width  = max(
-        len("  ".join(f"{k}={v}" for k, v in p.items())) for *_, p in ranked
-    )
-    sep    = "─" * (width + 34)
-    header = f"{'rank':<6}{'avg_proxy':<12}{'n_bench':<9}  params"
-    print(f"\n{sep}\n{header}\n{sep}")
-    for rank, (cid, ap, nb, params) in enumerate(ranked, 1):
-        label  = "  ".join(f"{k}={v}" for k, v in params.items())
-        marker = "  ← best" if rank == 1 else ""
-        print(f"{rank:<6}{ap:<12.4f}{nb:<9}  {label}{marker}")
-    print(sep)
+        best_cid, best_ap, best_nb, best_params = ranked[0]
+        out_lines.append(f"Best: avg_proxy={best_ap:.4f}  {best_params}")
 
-    best_cid, best_ap, best_nb, best_params = ranked[0]
-    print(f"Best: avg_proxy={best_ap:.4f}  {best_params}")
+    # ── Per-benchmark best proxy ──────────────────────────────────────────────
+    bench_best: dict[str, float] = {}
+    for _, _, result in collected:
+        b = result.get("benchmark")
+        p = result.get("proxy")
+        if b and p is not None:
+            if b not in bench_best or p < bench_best[b]:
+                bench_best[b] = p
 
-    if args.keep_best:
+    if bench_best:
+        avg_best = sum(bench_best.values()) / len(bench_best)
+        out_lines.append("\n── Best proxy per benchmark ─────────────────────────")
+        for b in sorted(bench_best):
+            out_lines.append(f"  {b:<10}  {bench_best[b]:.4f}")
+        out_lines.append(f"  {'avg':<10}  {avg_best:.4f}")
+
+    print("\n".join(out_lines))
+
+    with open(sweep_run_dir / "sweep_info.md", "a") as f:
+        f.write("\n## Console Output\n\n```\n")
+        f.write("\n".join(out_lines))
+        f.write("\n```\n")
+
+    if args.keep_best and ranked:
         CONFIG_PATH.write_text(patch_config(original_config, best_params))
         print(f"Wrote best config to {CONFIG_PATH.relative_to(REPO_ROOT)}")
 

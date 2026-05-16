@@ -55,14 +55,14 @@ def compute_rudy_map(
     y_min = big.clone().scatter_reduce_(0, net_ids_t, pin_pos[:, 1], reduce="amin", include_self=True)
     y_max = neg.clone().scatter_reduce_(0, net_ids_t, pin_pos[:, 1], reduce="amax", include_self=True)
 
-    bbox_w = (x_max - x_min).clamp(min=1e-6)
-    bbox_h = (y_max - y_min).clamp(min=1e-6)
-    hpwl_k = bbox_w + bbox_h
-    demand  = hpwl_k / (bbox_w * bbox_h)  # [K]  wires per unit area
-
     cell_w    = canvas_w / grid_cols
     cell_h    = canvas_h / grid_rows
     cell_area = cell_w * cell_h
+
+    bbox_w = (x_max - x_min).clamp(min=cell_w)
+    bbox_h = (y_max - y_min).clamp(min=cell_h)
+    hpwl_k = bbox_w + bbox_h
+    demand  = hpwl_k / (bbox_w * bbox_h)  # [K]  wires per unit area
 
     col_edges = torch.linspace(0.0, canvas_w, grid_cols + 1, device=device)  # [C+1]
     row_edges = torch.linspace(0.0, canvas_h, grid_rows + 1, device=device)  # [R+1]

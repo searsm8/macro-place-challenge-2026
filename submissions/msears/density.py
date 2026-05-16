@@ -133,7 +133,8 @@ def _getSpectralConstants(rows, cols, dtype, device):
 # ===========================================================================
 
 def _buildDensityMapExact(pos, benchmark, target_density, density_mask=None,
-                          halo_size=0.0, grid_rows=None, grid_cols=None):
+                          halo_size=0.0, grid_rows=None, grid_cols=None,
+                          hard_macro_weight=1.0, soft_macro_weight=1.0):
     """
     Build density map [rows, cols] using exact rectangular overlap.
 
@@ -171,10 +172,22 @@ def _buildDensityMapExact(pos, benchmark, target_density, density_mask=None,
     else:
         eff_sizes = real_sizes
 
+    # Per-macro charge weights: hard macros get hard_macro_weight, soft get soft_macro_weight.
+    # Built before density_mask filtering so [:num_hard] is still valid.
+    num_hard = benchmark.num_hard_macros
+    if hard_macro_weight != 1.0 or soft_macro_weight != 1.0:
+        charge_weights = torch.ones(num_macros, dtype=pos.dtype, device=pos.device)
+        charge_weights[:num_hard] = hard_macro_weight
+        charge_weights[num_hard:] = soft_macro_weight
+    else:
+        charge_weights = None
+
     if density_mask is not None:
         density_pos = pos[density_mask]
         real_sizes  = real_sizes[density_mask]
         eff_sizes   = eff_sizes[density_mask]
+        if charge_weights is not None:
+            charge_weights = charge_weights[density_mask]
     else:
         density_pos = pos
 
@@ -187,6 +200,8 @@ def _buildDensityMapExact(pos, benchmark, target_density, density_mask=None,
     clamp_w = eff_w.clamp(min=bin_w * sqrt2)
     clamp_h = eff_h.clamp(min=bin_h * sqrt2)
     area_ratio = (orig_w * orig_h) / (clamp_w * clamp_h)
+    if charge_weights is not None:
+        area_ratio = area_ratio * charge_weights
 
     # Clamped macro extents (using only the macros that contribute density)
     x_lo = density_pos[:, 0] - clamp_w / 2
@@ -266,7 +281,8 @@ def _bilinearInterp(field, x_pos, y_pos, bin_w, bin_h, rows, cols):
 
 def _densityGradientElectrostatic(pos, benchmark, target_density,
                                    density_mask=None, halo_size=0.0,
-                                   grid_rows=None, grid_cols=None):
+                                   grid_rows=None, grid_cols=None,
+                                   hard_macro_weight=1.0, soft_macro_weight=1.0):
     """
     Compute electrostatic density gradient and metrics.
 
@@ -298,7 +314,9 @@ def _densityGradientElectrostatic(pos, benchmark, target_density,
     with torch.no_grad():
         density_map = _buildDensityMapExact(pos, benchmark, target_density,
                                             density_mask, halo_size,
-                                            grid_rows=rows, grid_cols=cols)
+                                            grid_rows=rows, grid_cols=cols,
+                                            hard_macro_weight=hard_macro_weight,
+                                            soft_macro_weight=soft_macro_weight)
 
         field_ex, field_ey = _poissonFftSolve(
             density_map, bin_w, bin_h,
@@ -454,7 +472,8 @@ def computePoissonGradient(map_2d, pos, benchmark, grid_rows=None, grid_cols=Non
 
 def computeDensityGradient(method, pos, benchmark, target_density,
                            density_mask=None, halo_size=0.0,
-                           grid_rows=None, grid_cols=None):
+                           grid_rows=None, grid_cols=None,
+                           hard_macro_weight=1.0, soft_macro_weight=1.0):
     """
     Compute density gradient (spreading force) for each macro.
 
@@ -482,6 +501,8 @@ def computeDensityGradient(method, pos, benchmark, target_density,
     elif method == "electrostatic":
         return _densityGradientElectrostatic(pos, benchmark, target_density,
                                              density_mask, halo_size,
-                                             grid_rows=grid_rows, grid_cols=grid_cols)
+                                             grid_rows=grid_rows, grid_cols=grid_cols,
+                                             hard_macro_weight=hard_macro_weight,
+                                             soft_macro_weight=soft_macro_weight)
     else:
         raise ValueError(f"Unknown density method: {method!r}")

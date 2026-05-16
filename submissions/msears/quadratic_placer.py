@@ -39,6 +39,18 @@ import scipy.sparse.linalg
 import torch
 
 
+def _section_grid(n):
+    """
+    Factor n into (n_cols, n_rows) with n_cols >= n_rows, closest to square.
+    Examples: 4 → (2,2), 8 → (4,2), 6 → (3,2), 1 → (1,1).
+    """
+    best_c, best_r = 1, n
+    for c in range(2, int(n ** 0.5) + 1):
+        if n % c == 0:
+            best_c, best_r = n // c, c   # n//c >= c since c <= sqrt(n)
+    return best_c, best_r
+
+
 def select_scatter_ids(benchmark, scatter_fraction, scatter_n=0):
     """
     Return global hard-macro indices for scatter selection.
@@ -134,6 +146,27 @@ def quadratic_init(net_data, benchmark, cfg):
         scatter_pos = np.empty((len(scatter_ids), 2), dtype=np.float64)
         scatter_pos[:, 0] = rng.uniform(half_w[scatter_ids], canvas_w - half_w[scatter_ids])
         scatter_pos[:, 1] = rng.uniform(half_h[scatter_ids], canvas_h - half_h[scatter_ids])
+
+        # Constrain the largest scatter macro (scatter_ids[0]) to a canvas section.
+        # Other scatter macros are placed freely across the full canvas.
+        section_count = cfg.get("quad_scatter_section_count", 1)
+        if section_count > 1:
+            section_idx = cfg.get("quad_scatter_section_idx", 0)
+            n_cols, n_rows = _section_grid(section_count)
+            col = section_idx % n_cols
+            row = section_idx // n_cols
+            sec_x_lo = col * canvas_w / n_cols
+            sec_x_hi = (col + 1) * canvas_w / n_cols
+            sec_y_lo = row * canvas_h / n_rows
+            sec_y_hi = (row + 1) * canvas_h / n_rows
+            m0 = scatter_ids[0]
+            lo_x = max(sec_x_lo, float(half_w[m0]))
+            hi_x = min(sec_x_hi, float(canvas_w - half_w[m0]))
+            lo_y = max(sec_y_lo, float(half_h[m0]))
+            hi_y = min(sec_y_hi, float(canvas_h - half_h[m0]))
+            if lo_x < hi_x and lo_y < hi_y:
+                scatter_pos[0, 0] = rng.uniform(lo_x, hi_x)
+                scatter_pos[0, 1] = rng.uniform(lo_y, hi_y)
 
         # Fix scattered macros; solve quadratic for the rest
         fixed_s2   = fixed_mask_np.copy()

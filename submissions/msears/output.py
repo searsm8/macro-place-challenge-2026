@@ -171,21 +171,21 @@ class OutputManager:
 
     def openIterLog(self, benchmark):
         """Open iterations.dat for writing per-iteration metrics."""
-        if not self.record_iters:
+        if self.quiet or not self.record_iters:
             return
         iter_path = Path(self.frames_dir).parent / "data" / benchmark.name / "iterations.dat"
         iter_path.parent.mkdir(parents=True, exist_ok=True)
         self._iter_fh = open(iter_path, "w")
-        self._iter_fh.write("Iter, phase, HPWL, OVFW, alpha, lambda, gamma, stop_reason\n")
+        self._iter_fh.write("Iter, phase, HPWL, OVFW, alpha, lambda, lambda_cong, gamma, stop_reason\n")
         self.log(f"  Iteration log   -> {iter_path}")
 
     def writeIter(self, iter_num, phase, wl_loss, overflow, alpha, lambda_d, gamma,
-                  stop_reason=""):
+                  stop_reason="", lambda_cong=0.0):
         """Write one row to iterations.dat."""
         if self._iter_fh is not None:
             self._iter_fh.write(
                 f"{iter_num+1:04d}, {phase}, {wl_loss:.4e}, {overflow:.4e}, "
-                f"{alpha:.4e}, {lambda_d:.4e}, {gamma:.4e}, {stop_reason}\n")
+                f"{alpha:.4e}, {lambda_d:.4e}, {lambda_cong:.4e}, {gamma:.4e}, {stop_reason}\n")
 
     def shouldLog(self, iter_num, max_iters):
         """Return True if this iteration should print a progress line."""
@@ -307,6 +307,8 @@ class OutputManager:
         snapshots: list of dicts with keys:
           phase, hpwl, hard_overlaps, overflow (optional), soft_disp (optional)
         """
+        if self.quiet:
+            return
         out_path = Path(self.frames_dir).parent / "data" / benchmark.name / "run_summary.md"
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with open(out_path, "w") as fh:

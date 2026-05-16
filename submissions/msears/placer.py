@@ -409,9 +409,9 @@ class CometPlacer:
 
         self.cong_rudy_enable    = _asBool(cong_cfg.get("cong_rudy_enable", False))
         self.cong_rudy_grid_size = int(cong_cfg.get("cong_rudy_grid_size", 32))
-        self.lambda_cong                = float(cong_cfg.get("lambda_cong", 0.0))
-        self.lambda_cong_step           = float(cong_cfg.get("lambda_cong_step", 1.0))
-        self.lambda_cong_update_interval = int(cong_cfg.get("lambda_cong_update_interval", 3))
+        self.lambda_cong_init            = float(cong_cfg.get("lambda_cong_init", 0.0))
+        self.lambda_cong_ramp            = float(cong_cfg.get("lambda_cong_ramp", 1.05))
+        self.cong_start_overflow         = float(cong_cfg.get("cong_start_overflow", 0.2))
 
         self.last_metrics: dict = {}
 
@@ -444,8 +444,9 @@ class CometPlacer:
         self.legalization = p.get("legalization", "none")
         self.cgp_enable = _asBool(p.get("cGP_enable", p.get("soft_place", False)))
         self.cgp_position_reset = _asBool(p.get("cGP_position_reset", False))
-        self.cgp_lambda_cong_init = float(p.get("cGP_lambda_cong_init", 0.0))
-        self.cgp_hard_density = _asBool(p.get("cGP_hard_density", True))
+        self.cgp_hard_macro_density_weight = float(p.get("cGP_hard_macro_density_weight", 1.0))
+        self.hard_macro_density_weight = float(p.get("mGP_hard_macro_density_weight", 1.0))
+        self.soft_macro_density_weight = float(p.get("mGP_soft_macro_density_weight", 1.0))
         self.hard_spread = _asBool(p.get("hard_spread", False))
         self.hard_spread_iters = p.get("hard_spread_iters", 50)
         self.halo_size = float(p.get("halo_size", 0.0))
@@ -463,6 +464,9 @@ class CometPlacer:
         self.sa_T_init           = p.get("sa_T_init", 1e-4)
         self.sa_T_final          = p.get("sa_T_final", 1e-7)
         self.sa_steps_per_macro  = p.get("sa_steps_per_macro", 200)
+        self.sa_mlg_outer_iters     = int(p.get("sa_mlg_outer_iters",     10))
+        self.sa_mlg_steps_per_macro = int(p.get("sa_mlg_steps_per_macro", 50))
+        self.sa_mlg_beta            = float(p.get("sa_mlg_beta",          1.5))
         _cand_map = {
             "NS":       (0, 2),
             "no-swap":  (0, 1, 2, 3),
@@ -472,20 +476,20 @@ class CometPlacer:
         self.n_placement_passes   = p.get("n_placement_passes", 1)
 
     def _readLambdaParams(self, p):
-        self.lambda_schedule = p.get("lambda_schedule", "hpwl")
-        self.density_weight = p.get("lambda_density_init", 8e-4)
-        self.lambda_pcof_upper = p.get("lambda_pcof_upper", 1.05)
-        self.lambda_pcof_lower = p.get("lambda_pcof_lower", 0.95)
-        self.density_weight_init = p.get("density_weight_init", 1e-5)
-        self.density_weight_max_step = p.get("density_weight_max_step", 1.04)
+        self.lambda_den_schedule = p.get("lambda_den_schedule", "hpwl")
+        self.lambda_den_init = p.get("lambda_den_init", 8e-4)
+        self.lambda_den_pcof_upper = p.get("lambda_den_pcof_upper", 1.05)
+        self.lambda_den_pcof_lower = p.get("lambda_den_pcof_lower", 0.95)
+        self.lambda_den_weight_init = p.get("lambda_den_weight_init", 1e-5)
+        self.lambda_den_max_step = p.get("lambda_den_max_step", 1.04)
         self.warmup_iters = p.get("warmup_iters", 20)
-        self.density_weight_max = p.get("lambda_max", 5000.0)
+        self.lambda_den_max = p.get("lambda_den_max", 5000.0)
         self.target_density = p.get("target_density", 0.5)
         # Hard-macro density boost: multiplies density gradient for hard macros
         # only, starts at lambda_hm_init and decays toward 1.0 each iteration.
         self.lambda_hm_init = p.get("lambda_hm_init", 3.0)
         self.lambda_hm_decay = p.get("lambda_hm_decay", 0.995)
-        self.lambda_iters_per_update = p.get("lambda_iters_per_update", 1)
+        self.lambda_den_iters_per_update = p.get("lambda_den_iters_per_update", 1)
 
     def _readConvergenceParams(self, p):
         self.stop_overflow = p.get("stop_overflow", 0.1)
@@ -508,6 +512,11 @@ class CometPlacer:
         self.quad_scatter_n         = p.get("quad_scatter_n", 0)
         self.quad_scatter_fraction  = p.get("quad_scatter_fraction", 0.0)
         self.scatter_lock_mult      = p.get("quad_scatter_lock_mult", 0.0)
+        self.quad_scatter_section_count    = int(p.get("quad_scatter_section_count", 1))
+        self.quad_scatter_runs_per_section = int(p.get("quad_scatter_runs_per_section", 1))
+        # Runtime section context — updated per run in multi-section mode
+        self._section_idx   = 0
+        self._section_count = 1
 
     def placeWithData(self, benchmark, net_data: dict):
         """
@@ -651,6 +660,8 @@ class CometPlacer:
     # -------------------------------------------------------------------
 
     def place(self, benchmark):
+        total_runs = self.quad_scatter_section_count * self.quad_scatter_runs_per_section
+
         torch.manual_seed(self.seed)
         # Seed the CUDA RNG explicitly — torch.manual_seed() alone may not cover it
         # on all PyTorch versions.
@@ -668,6 +679,9 @@ class CometPlacer:
         self._timer.reset()
 
         _output.printBenchmarkInfo(benchmark, self.density_method)
+
+        if total_runs > 1:
+            return self._multiSectionPlace(benchmark, total_runs, start_time)
 
         self._timer.start("setup")
         plc = _loadPlc(benchmark.name)
@@ -757,6 +771,172 @@ class CometPlacer:
         return full_pos
 
     # -------------------------------------------------------------------
+    # Multi-section placement loop
+    # -------------------------------------------------------------------
+
+    def _multiSectionPlace(self, benchmark, total_runs, start_time):
+        """
+        Run the full placement pipeline total_runs times, sweeping the largest
+        scatter macro across canvas sections and varying the RNG seed.
+
+        Seeds are derived deterministically from the master seed:
+            run k uses seed = master_seed + k
+
+        Returns the full_pos of the run with the best proxy cost (0-overlap
+        runs preferred over runs with overlaps).
+        """
+        from macro_place.objective import compute_proxy_cost
+
+        master_seed = self.seed
+        n_sec = self.quad_scatter_section_count
+
+        saved_out = self._out
+        quiet_out = _output.OutputManager({
+            "quiet": True,
+            "record_frames": False,
+            "frames_dir": saved_out.frames_dir,
+        })
+
+        initial_macro_sizes = benchmark.macro_sizes.clone()
+
+        best_proxy       = float("inf")
+        best_full_pos    = None
+        best_macro_sizes = None
+        best_costs       = None
+        best_has_valid   = False   # True when best run has 0 overlaps
+
+        saved_out.log(
+            f"  [multi-section] {total_runs} total runs  "
+            f"sections={n_sec}  runs_per_section={self.quad_scatter_runs_per_section}"
+        )
+
+        time_limit_s  = 55 * 60   # stop scheduling new runs past this elapsed time
+        run_durations = []        # wall-clock seconds for each completed run
+
+        for run_idx in range(total_runs):
+            # Time-budget check: if elapsed + projected next run would exceed limit, stop.
+            elapsed = time.time() - start_time
+            if run_durations:
+                avg_run = sum(run_durations) / len(run_durations)
+                if elapsed + avg_run > time_limit_s:
+                    saved_out.log(
+                        f"  [multi-section] time budget: elapsed={elapsed/60:.1f}m  "
+                        f"avg_run={avg_run/60:.1f}m  projected={( elapsed+avg_run)/60:.1f}m > 55m  "
+                        f"stopping after {run_idx}/{total_runs} runs"
+                    )
+                    break
+
+            section_idx        = run_idx // self.quad_scatter_runs_per_section
+            within_section_idx = run_idx  % self.quad_scatter_runs_per_section
+            # Seed layout: master + section + within * n_sections
+            # Guarantees that run 0 of each section is stable across runs_per_section
+            # values, so higher runs_per_section strictly extends the search.
+            run_seed = master_seed + section_idx + within_section_idx * n_sec
+
+            run_start = time.time()
+
+            # Restore benchmark state modified by previous run's orientation swaps
+            if run_idx > 0:
+                benchmark.macro_sizes.copy_(initial_macro_sizes)
+
+            # Set per-run context (used by _initialPlacement → quadratic_init)
+            self._section_idx   = section_idx
+            self._section_count = n_sec
+            self.seed           = run_seed
+            self._out           = quiet_out
+
+            torch.manual_seed(run_seed)
+            if self.device.type == "cuda":
+                torch.cuda.manual_seed(run_seed)
+            np.random.seed(run_seed)
+
+            # Load plc + net_data
+            plc = _loadPlc(benchmark.name)
+            if plc is None:
+                saved_out.log(f"  [run {run_idx+1}/{total_runs}] plc load failed, skipping")
+                continue
+            net_data = _buildNetData(benchmark, plc)
+            if net_data is None:
+                saved_out.log(f"  [run {run_idx+1}/{total_runs}] net_data build failed, skipping")
+                continue
+
+            net_data_base = net_data
+            genes = torch.zeros(benchmark.num_hard_macros, dtype=torch.int8)
+            nd    = net_data
+
+            for pass_idx in range(self.n_placement_passes):
+                if pass_idx > 0:
+                    nd  = self._buildRotatedNetData(genes, net_data_base)
+                    plc = _loadPlc(benchmark.name)
+                pos, genes = self._runPlacementPipeline(
+                    benchmark, nd, net_data_base, genes, plc,
+                    run_rotation=(pass_idx == 0),
+                )
+
+            # Sync final orientations to plc
+            if plc is not None:
+                for m in range(benchmark.num_hard_macros):
+                    gene = int(genes[m])
+                    if gene != 0:
+                        plc.update_macro_orientation(
+                            plc.hard_macro_indices[m], self._OUR_ORI_TO_PLC[gene]
+                        )
+
+            full_pos = benchmark.macro_positions.clone()
+            full_pos[:benchmark.num_macros] = pos
+
+            costs  = compute_proxy_cost(pos, benchmark, plc)
+            proxy  = costs["proxy_cost"]
+            n_ovlp = costs["overlap_count"]
+            is_valid = (n_ovlp == 0)
+
+            run_durations.append(time.time() - run_start)
+
+            saved_out.log(
+                f"  [run {run_idx+1:2d}/{total_runs}]  "
+                f"sec={section_idx}  seed={run_seed}  "
+                f"proxy={proxy:.4f}  "
+                f"wl={costs['wirelength_cost']:.4f}  "
+                f"den={costs['density_cost']:.4f}  "
+                f"cong={costs['congestion_cost']:.4f}  "
+                f"overlaps={n_ovlp}  "
+                f"({run_durations[-1]/60:.1f}m)"
+            )
+
+            # Prefer 0-overlap; among equal validity, take lower proxy
+            if (is_valid and not best_has_valid) or (
+                is_valid == best_has_valid and proxy < best_proxy
+            ):
+                best_proxy       = proxy
+                best_full_pos    = full_pos.clone()
+                best_macro_sizes = benchmark.macro_sizes.clone()
+                best_costs       = costs
+                best_has_valid   = is_valid
+
+        # Restore placer state
+        self._out           = saved_out
+        self.seed           = master_seed
+        self._section_idx   = 0
+        self._section_count = 1
+
+        if best_full_pos is None:
+            return benchmark.macro_positions.clone()
+
+        benchmark.macro_sizes.copy_(best_macro_sizes)
+
+        saved_out.log(
+            f"\n  [multi-section] best: proxy={best_costs['proxy_cost']:.4f}  "
+            f"(wl={best_costs['wirelength_cost']:.4f}  "
+            f"den={best_costs['density_cost']:.4f}  "
+            f"cong={best_costs['congestion_cost']:.4f}  "
+            f"overlaps={best_costs['overlap_count']})"
+        )
+        saved_out.saveProxyScore(best_costs)
+        saved_out.log(f"  Total time: {time.time()-start_time:.1f}s")
+
+        return best_full_pos
+
+    # -------------------------------------------------------------------
     # Gradient descent loop
     # -------------------------------------------------------------------
 
@@ -815,7 +995,7 @@ class CometPlacer:
         # Phase 3: mLG — reset best_pos to legalized result so cGP tracks from clean baseline
         self._out.banner("Phase 3: mLG")
         self._timer.start("mLG")
-        self._macroLegalization(state, last_t, benchmark)
+        self._macroLegalization(state, last_t, benchmark, net_data)
         self._timer.stop("mLG")
         self._out.banner("Phase 3: mLG  done")
         state["best_pos"] = state["pos"].clone()
@@ -880,8 +1060,8 @@ class CometPlacer:
         self._out.banner(f"Phase 2: mGP  done (iters={t + 1})")
         return t
 
-    def _macroLegalization(self, state, last_t, benchmark):
-        """Phase 3 (mLG): remove hard-macro overlaps via bump or spiral push-out."""
+    def _macroLegalization(self, state, last_t, benchmark, net_data):
+        """Phase 3 (mLG): remove hard-macro overlaps via bump, spiral, or SA."""
         if self.legalization == "bump":
             self._out.log("  Legalizing (pairwise bump)...")
             state["pos"] = _legalizer.bumpLegalize(
@@ -897,6 +1077,20 @@ class CometPlacer:
             state["pos"] = _legalizer.spiralLegalize(
                 state["pos"].cpu(), benchmark,
                 verbose=self._out.legalization_details,
+                quiet=self._out.quiet,
+            ).to(self.device)
+            last_ovfw = state["overflow_history"][-1] if state["overflow_history"] else 0.0
+            self._out.saveLegalFrame(last_t, state["pos"], state["prev_wl"],
+                                     last_ovfw, state["gamma"], benchmark, state["num_macros"])
+        elif self.legalization == "sa":
+            self._out.log("  Legalizing (SA)...")
+            nd_cpu = {k: v.cpu() if isinstance(v, torch.Tensor) else v
+                      for k, v in net_data.items()}
+            state["pos"] = _legalizer.saLegalize(
+                state["pos"].cpu(), benchmark, nd_cpu,
+                outer_iters=self.sa_mlg_outer_iters,
+                steps_per_macro=self.sa_mlg_steps_per_macro,
+                beta=self.sa_mlg_beta,
                 quiet=self._out.quiet,
             ).to(self.device)
             last_ovfw = state["overflow_history"][-1] if state["overflow_history"] else 0.0
@@ -922,12 +1116,12 @@ class CometPlacer:
         # Reset lambda to the base density_weight — by convergence lambda_d can
         # be 100–5000×, which would make the phase 2.5 force overwhelming.
         prev_lambda = state["lambda_d"]
-        state["lambda_d"] = self.density_weight
+        state["lambda_d"] = self.lambda_den_init
 
         self._out.log(
             f"  Phase 2.5 (hard spread): {self.hard_spread_iters} iters — "
             f"soft macros excluded from density map  "
-            f"lambda reset {prev_lambda:.2e} -> {self.density_weight:.2e}")
+            f"lambda reset {prev_lambda:.2e} -> {self.lambda_den_init:.2e}")
 
         last_t = frame_offset
         for s in range(self.hard_spread_iters):
@@ -1025,9 +1219,10 @@ class CometPlacer:
             "init_pos": pos.clone(),  # _clampPositions restores fixed macros to this
             "lambda_d": 0.0,
             "lambda_cong_eff": 0.0,
+            "lambda_cong_target": 0.0,
             "lambda_hm": 1.0,         # no hard-macro boost; they're fixed anyway
             "hard_mask": benchmark.get_hard_macro_mask().to(self.device),
-            "density_mask": None if self.cgp_hard_density else ~benchmark.get_hard_macro_mask()[:num_macros].to(self.device),
+            "hard_macro_weight": self.cgp_hard_macro_density_weight,
             "best_wl": float("inf"),
             "best_pos": pos.clone(),
             "prev_wl": float("inf"),
@@ -1052,16 +1247,10 @@ class CometPlacer:
                 state["pos"][num_hard:, 1] = canvas_h / 2.0
             state["best_pos"] = state["pos"].clone()
 
-        # Seed lambda_cong_eff from config if provided; _computeCongGradient will
-        # auto-scale on first call only when lambda_cong_eff == 0.
-        if self.cgp_lambda_cong_init > 0.0:
-            state["lambda_cong_eff"] = self.cgp_lambda_cong_init
-
         self._out.log(
             f"  Phase 4 (cGP): {benchmark.num_soft_macros} soft macros free  "
             f"max_iters={self.cgp_iters}  warmup={self.warmup_iters}  "
-            f"gamma0={gamma:.3f}  pos_reset={self.cgp_position_reset}  "
-            f"lambda_cong_init={self.cgp_lambda_cong_init}")
+            f"gamma0={gamma:.3f}  pos_reset={self.cgp_position_reset}")
 
         for t in range(self.cgp_iters):
             eval_pos = state["pos"]
@@ -1070,7 +1259,7 @@ class CometPlacer:
             den_grad, den_energy, overflow, max_den = self._computeDenGradient(
                 t, eval_pos, benchmark, state)
             cong_grad = self._computeCongGradient(
-                t, eval_pos, net_data, benchmark, state, wl_grad)
+                t, eval_pos, net_data, benchmark, state, wl_grad, overflow)
 
             grad = self._combineGradients(wl_grad, den_grad, state, cong_grad)
 
@@ -1079,7 +1268,7 @@ class CometPlacer:
                 alpha = self._stepSgd(grad, state)
 
             self._trackBestWl(wl_val, overflow, state)
-            if t % self.lambda_iters_per_update == 0:
+            if t % self.lambda_den_iters_per_update == 0:
                 self._updateLambda(t, wl_val, wl_grad, den_grad, den_energy, state,
                                    overflow=overflow)
             if t % self.gamma_iters_per_update == 0:
@@ -1094,7 +1283,8 @@ class CometPlacer:
             converged = self._checkConvergence(t, wl_val, overflow, max_den, state)
             self._out.writeIter(t, "cGP", wl_val, overflow, alpha, state["lambda_d"],
                                 state["gamma"],
-                                stop_reason=state["stop_reason"] if converged else "")
+                                stop_reason=state["stop_reason"] if converged else "",
+                                lambda_cong=state["lambda_cong_eff"])
             state["prev_wl"] = wl_val
             state["prev_overflow"] = overflow
 
@@ -1107,7 +1297,7 @@ class CometPlacer:
 
         self._out.log(f"  [cGP] done  iters={t + 1}  wl={state['prev_wl']:.4f}")
         self._out.banner(f"Phase 4: cGP  done (iters={t + 1})")
-        return state["pos"]
+        return state["best_pos"]
 
     def _initState(self, benchmark, net_data):
         """Initialise all loop state variables."""
@@ -1172,6 +1362,7 @@ class CometPlacer:
             "init_pos": init_pos,
             "lambda_d": 0.0,
             "lambda_cong_eff": 0.0,
+            "lambda_cong_target": 0.0,
             "lambda_hm": self.lambda_hm_init,
             "hard_mask": benchmark.get_hard_macro_mask().to(self.device),
             "best_wl": float("inf"),
@@ -1184,6 +1375,8 @@ class CometPlacer:
             "overflow_ema": float("inf"),
             "density_mask": None,  # None = all macros contribute; set for phase 4
             "halo_size": self.halo_size,
+            "hard_macro_weight": self.hard_macro_density_weight,
+            "soft_macro_weight": self.soft_macro_density_weight,
             "stop_reason": "",
             "conv_life": None,
             "macro_locks": [],
@@ -1269,7 +1462,9 @@ class CometPlacer:
                    "quad_anchor_fraction": self.quad_anchor_fraction,
                    "quad_scatter_n": self.quad_scatter_n,
                    "quad_scatter_fraction": self.quad_scatter_fraction,
-                   "seed": self.seed}
+                   "seed": self.seed,
+                   "quad_scatter_section_count": self._section_count,
+                   "quad_scatter_section_idx":   self._section_idx}
             self._out.log("  Quadratic WL init (mIP)...", flush=True)
             # quadratic_placer uses numpy/scipy and requires CPU tensors.
             cpu_net_data = {k: v.cpu() if isinstance(v, torch.Tensor) else v
@@ -1326,7 +1521,7 @@ class CometPlacer:
         wl_grad, wl_val = self._computeWlGradient(eval_pos, net_data, state["gamma"])
         den_grad, den_energy, overflow, max_den = self._computeDenGradient(
             t, eval_pos, benchmark, state)
-        cong_grad = self._computeCongGradient(t, eval_pos, net_data, benchmark, state, wl_grad)
+        cong_grad = self._computeCongGradient(t, eval_pos, net_data, benchmark, state, wl_grad, overflow)
 
         grad = self._combineGradients(wl_grad, den_grad, state, cong_grad)
 
@@ -1346,7 +1541,7 @@ class CometPlacer:
                 return True
 
         self._trackBestWl(wl_val, overflow, state)
-        if t % self.lambda_iters_per_update == 0:
+        if t % self.lambda_den_iters_per_update == 0:
             self._updateLambda(t, wl_val, wl_grad, den_grad, den_energy, state,
                                overflow=overflow)
         if t % self.gamma_iters_per_update == 0:
@@ -1355,11 +1550,6 @@ class CometPlacer:
         if state["lambda_hm"] > 1.0:
             state["lambda_hm"] = max(1.0, state["lambda_hm"] * self.lambda_hm_decay)
 
-        # Ramp congestion weight
-        if (self.lambda_cong_step != 1.0
-                and state["lambda_cong_eff"] > 0.0
-                and t % self.lambda_cong_update_interval == 0):
-            state["lambda_cong_eff"] *= self.lambda_cong_step
 
         if self._out.shouldLog(t, self.max_iters):
             self._out.log(
@@ -1370,7 +1560,8 @@ class CometPlacer:
         converged = self._checkConvergence(t, wl_val, overflow, max_den, state)
         self._out.writeIter(t, "mGP", wl_val, overflow, alpha, state["lambda_d"],
                             state["gamma"],
-                            stop_reason=state["stop_reason"] if converged else "")
+                            stop_reason=state["stop_reason"] if converged else "",
+                            lambda_cong=state["lambda_cong_eff"])
 
         state["prev_wl"] = wl_val
         state["prev_overflow"] = overflow
@@ -1395,39 +1586,53 @@ class CometPlacer:
         """Compute density gradient (or zeros during warmup)."""
         need_density = (state["lambda_d"] > 0.0 or
                         (t == self.warmup_iters
-                         and self.lambda_schedule == "hpwl"))
+                         and self.lambda_den_schedule == "hpwl"))
         if need_density:
             return _density.computeDensityGradient(
                 self.density_method, eval_pos, benchmark, self.target_density,
                 density_mask=state.get("density_mask"),
                 halo_size=state.get("halo_size", 0.0),
                 grid_rows=self.density_grid_rows,
-                grid_cols=self.density_grid_cols)
+                grid_cols=self.density_grid_cols,
+                hard_macro_weight=state.get("hard_macro_weight", 1.0),
+                soft_macro_weight=state.get("soft_macro_weight", 1.0))
         return (torch.zeros_like(state["pos"]), 0.0, float("inf"), float("inf"))
 
-    def _computeCongGradient(self, t, eval_pos, net_data, benchmark, state, wl_grad):
-        """Compute RUDY congestion gradient (or None when disabled/warmup).
+    def _computeCongGradient(self, t, eval_pos, net_data, benchmark, state, wl_grad, overflow=float("inf")):
+        """Compute RUDY congestion gradient (or None when disabled/warmup/overflow too high).
 
-        On the first post-warmup call, auto-initialises lambda_cong_eff using
-        the same wl_norm / cong_norm ratio as _initLambda does for lambda_d.
+        On first activation, the target weight is calibrated once against the WL gradient:
+          lambda_cong_target = lambda_cong_init * wl_max / cong_max
+        lambda_cong_eff then ramps from 1% of target toward target by lambda_cong_ramp
+        each iteration, so congestion activates gradually rather than with a hard jolt.
         """
-        if self.lambda_cong <= 0.0 or t < self.warmup_iters:
+        if self.lambda_cong_init <= 0.0 or t < self.warmup_iters or overflow > self.cong_start_overflow:
             return None
         rudy = _congestion.compute_rudy_map(
             eval_pos, net_data,
             float(benchmark.canvas_width), float(benchmark.canvas_height),
             self.density_grid_rows, self.density_grid_cols,
         )
-        rudy = rudy - rudy.mean()
+        rudy = (rudy - rudy.mean()).clamp(min=0.0)  # overflow-only: zero out under-capacity bins
         cong_grad = _density.computePoissonGradient(
             rudy, eval_pos, benchmark,
             self.density_grid_rows, self.density_grid_cols,
         )
-        if state["lambda_cong_eff"] == 0.0:
-            wl_norm   = wl_grad.norm(p=1).item()
-            cong_norm = cong_grad.norm(p=1).item()
-            state["lambda_cong_eff"] = self.lambda_cong * wl_norm / (cong_norm + 1e-8)
-            self._out.log(f"  lambda_cong init: {state['lambda_cong_eff']:.3e}")
+        if state["lambda_cong_target"] == 0.0:
+            wl_max   = wl_grad.abs().max().item()
+            cong_max = cong_grad.abs().max().item()
+            target   = self.lambda_cong_init * wl_max / (cong_max + 1e-8)
+            state["lambda_cong_target"] = target
+            state["lambda_cong_eff"]    = target * 0.01
+            self._out.log(
+                f"  cong activated: target={target:.3e}  "
+                f"(wl_max={wl_max:.3e}  cong_max={cong_max:.3e})  ramp={self.lambda_cong_ramp}"
+            )
+        else:
+            state["lambda_cong_eff"] = min(
+                state["lambda_cong_eff"] * self.lambda_cong_ramp,
+                state["lambda_cong_target"],
+            )
         return cong_grad
 
     def _combineGradients(self, wl_grad, den_grad, state, cong_grad=None):
@@ -1576,14 +1781,14 @@ class CometPlacer:
 
     def _initLambda(self, wl_val, wl_grad, den_grad, state, overflow=None):
         """Auto-initialise lambda at warmup transition."""
-        if self.lambda_schedule == "hpwl":
+        if self.lambda_den_schedule == "hpwl":
             wl_norm = wl_grad.norm(p=1).item()
             den_norm = den_grad.norm(p=1).item()
-            state["lambda_d"] = self.density_weight * wl_norm / (den_norm + 1e-8)
+            state["lambda_d"] = self.lambda_den_init * wl_norm / (den_norm + 1e-8)
             state["ref_hpwl"] = wl_val
             state["overflow_ema"] = overflow if overflow is not None else float("inf")
         else:
-            state["lambda_d"] = self.density_weight_init
+            state["lambda_d"] = self.lambda_den_weight_init
             state["overflow_ema"] = float("inf")
 
         if (self.scatter_lock_mult > 0
@@ -1614,7 +1819,7 @@ class CometPlacer:
           is 3× faster than the old every-3-iter approach, reaching the
           spreading threshold sooner.
         """
-        if self.lambda_schedule == "hpwl":
+        if self.lambda_den_schedule == "hpwl":
             ema = state.get("overflow_ema", float("inf"))
             if overflow is not None and ema < float("inf"):
                 state["overflow_ema"] = 0.9 * ema + 0.1 * overflow
@@ -1622,17 +1827,18 @@ class CometPlacer:
                     # Overflow is meaningfully below recent average — spreading is
                     # working; ramp gently (pcof_lower) so lambda still grows but
                     # doesn't overshoot.
-                    mu = self.lambda_pcof_lower
+                    mu = self.lambda_den_pcof_lower
                 else:
-                    mu = self.lambda_pcof_upper
+                    mu = self.lambda_den_pcof_upper
             else:
                 if overflow is not None:
                     state["overflow_ema"] = overflow
-                mu = self.lambda_pcof_upper
+                mu = self.lambda_den_pcof_upper
         else:
-            mu = self.density_weight_max_step
+            mu = self.lambda_den_max_step
 
-        state["lambda_d"] = min(state["lambda_d"] * mu, self.density_weight_max)
+        state["lambda_d"] = min(state["lambda_d"] * mu, self.lambda_den_max)
+
 
     # -------------------------------------------------------------------
     # Convergence checks
@@ -1705,7 +1911,7 @@ class CometPlacer:
 
     def _checkLambdaMax(self, overflow, state, t):
         """Lambda-max: lambda is pegged at ceiling AND overflow has stopped improving."""
-        if state["lambda_d"] < self.density_weight_max * 0.99:
+        if state["lambda_d"] < self.lambda_den_max * 0.99:
             return False
         w = self.plateau_window
         oh = state["overflow_history"]
