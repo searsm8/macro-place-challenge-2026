@@ -120,12 +120,13 @@ elite_k    = 2       # top-k individuals carried unchanged to next generation
 tourn_k    = 3       # tournament selection size
 mut_rate   = 0.25    # per-gene mutation probability
 seed       = 0       # RNG seed for GA (independent of placer seed)
-time_limit_mins = 55 # stop before starting a new run if elapsed + avg_run would exceed this
+time_limit_mins = 55 # total budget; GA stops with len(final_seeds)*avg_run reserved for the seed sweep
+final_seeds = [1, 2, 3, 42, 67, 69, 420, 6969]  # after GA, replay best_genes with each seed; [] = disabled
 
 [congestion]
 cong_rudy_enable    = true   # compute RUDY congestion map after placement (diagnostic only for now)
 cong_rudy_grid_size = 64     # grid resolution (square); independent of density_grid_size
-lambda_cong_target         = 3.2    # calibration scale: target = lambda_cong_target × wl_grad_max / cong_grad_max (0 = disabled)
+lambda_cong_target         = 0.32   # calibration scale: target = lambda_cong_target × wl_grad_max / cong_grad_max (0 = disabled)
 lambda_cong_init           = 0.01   # starting fraction of calibrated target: lambda_cong_eff = target * lambda_cong_init
 lambda_cong_ramp           = 1.05   # per-iter multiplier ramping lambda_cong_eff from init → target
 cong_start_overflow        = 0.4   # overflow threshold below which congestion gradient activates (Xplace default)

@@ -115,12 +115,12 @@ SWEEP = {
 IBM_BENCHMARKS = [
 
     # Full set
-    "ibm01", "ibm02", "ibm03", "ibm04", "ibm06", "ibm07", "ibm08", "ibm09",
-    "ibm10", "ibm11", "ibm12", "ibm13", "ibm14", "ibm15", "ibm16", "ibm17", "ibm18",
+    #"ibm01", "ibm02", "ibm03", "ibm04", "ibm06", "ibm07", "ibm08", "ibm09",
+    #"ibm10", "ibm11", "ibm12", "ibm13", "ibm14", "ibm15", "ibm16", "ibm17", "ibm18",
 
     
     # Medium Subset
-    #"ibm01", "ibm02",  "ibm04", "ibm07", "ibm11", "ibm14",
+    "ibm01", "ibm02",  "ibm04", "ibm14",
 
     # Small set
     #"ibm01", "ibm4, "ibm14", # best avg for this subset: 1.3782 (new best, 1.2525)

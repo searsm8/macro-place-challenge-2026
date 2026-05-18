@@ -30,21 +30,38 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from submissions.msears.ga_placer import GENE_SPACE
 
 
-def load_history(sweep_dir: Path, bench_filter: str | None) -> pd.DataFrame:
+def _to_float(v):
+    if v is None or isinstance(v, (int, float)):
+        return v
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return v
+
+
+def _bench_name(fp: Path, root: Path) -> str:
+    """Walk from the JSONL up to the sweep root; the first dir under root is the bench."""
+    rel = fp.relative_to(root).parts
+    return rel[0] if rel else fp.parent.name
+
+
+def load_history(sweep_dirs: list[Path], bench_filter: str | None) -> pd.DataFrame:
     rows = []
-    for fp in sweep_dir.rglob("ga_history.jsonl"):
-        bench = fp.parent.name  # vis/frames/<bench>/ga_history.jsonl
-        if bench_filter and bench != bench_filter:
-            continue
-        for line in fp.read_text().splitlines():
-            if not line.strip():
+    for sweep_dir in sweep_dirs:
+        for fp in sweep_dir.rglob("ga_history.jsonl"):
+            bench = _bench_name(fp, sweep_dir)
+            if bench_filter and bench != bench_filter:
                 continue
-            r = json.loads(line)
-            row = {"benchmark": bench, **{k: r.get(k) for k in
-                   ("gen", "ind", "run", "fitness", "proxy", "wl",
-                    "density", "cong", "overlaps", "elapsed")}}
-            row.update({f"g_{k}": v for k, v in r.get("genes", {}).items()})
-            rows.append(row)
+            for line in fp.read_text().splitlines():
+                if not line.strip():
+                    continue
+                r = json.loads(line)
+                row = {"benchmark": bench, "sweep": sweep_dir.name}
+                for k in ("gen", "ind", "run", "fitness", "proxy", "wl",
+                          "density", "cong", "overlaps", "elapsed"):
+                    row[k] = _to_float(r.get(k))
+                row.update({f"g_{k}": _to_float(v) for k, v in r.get("genes", {}).items()})
+                rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -137,7 +154,7 @@ def gen_trajectory(df: pd.DataFrame) -> pd.DataFrame:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("sweep_dir", type=Path)
+    ap.add_argument("sweep_dir", type=Path, nargs="+", help="One or more sweep directories")
     ap.add_argument("--bench", default=None, help="Filter to a single benchmark")
     ap.add_argument("--top-k", type=float, default=0.25,
                     help="Fraction (0-1) or count (>1) of best-fitness rows to treat as 'winners'")
@@ -147,6 +164,10 @@ def main():
     df = load_history(args.sweep_dir, args.bench)
     if df.empty:
         sys.exit(f"No ga_history.jsonl found under {args.sweep_dir}")
+    # Coerce key numeric columns
+    for col in ("fitness", "proxy", "wl", "density", "cong", "overlaps", "elapsed", "gen", "ind", "run"):
+        if col in df:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
     # winners = top-K by fitness (within-benchmark percentile so all benches contribute)
     df_valid = df[df["fitness"].notna()].copy()

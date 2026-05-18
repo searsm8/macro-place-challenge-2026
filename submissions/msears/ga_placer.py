@@ -32,16 +32,15 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 GENE_SPACE: dict[str, tuple] = {
-    "lambda_den_init":               ("log",    1e-7,  1e-4),
     "halo_size":                     ("linear", 0.16,   0.32),
     "max_step":                      ("linear", 0.003, 0.008),
     "target_density":                ("linear", 0.60,  0.80),
-    "mGP_hard_macro_density_weight": ("linear", 0.5,   1.5),
+    "mGP_hard_macro_density_weight": ("linear", 0.9,   1.5),
     #"cGP_enable":                   ("choice", [False, True]),
-    "seed":                          ("choice", [1, 2, 3, 42, 67, 69, 420, 6969]),
+    #"seed":                          ("choice", [0, 2, 420, 6969]), # Give the GA a few different random seeds to choose from
+    "lambda_den_init":               ("log",    8e-6,  1e-3),
     "lambda_cong_target":              ("linear", 0.25,   0.38),
-    "largest_macro_starting_section": ("choice", [1, 2, 3, 6]),  
-    "quad_scatter_lock_mult":       ("log", 1e5, 1e7),
+    "quad_scatter_lock_mult":       ("log", 1e5, 1e6),
 }
 
 # ---------------------------------------------------------------------------
@@ -49,11 +48,11 @@ GENE_SPACE: dict[str, tuple] = {
 # ---------------------------------------------------------------------------
 
 GA_DEFAULTS = {
-    "pop_size":  16,
+    "pop_size":  8,
     "n_gens":    5,
     "elite_k":   2,
     "tourn_k":   3,
-    "mut_rate":  0.25,
+    "mut_rate":  0.15,
     "seed":      0,
 }
 
@@ -93,7 +92,7 @@ def sample_individual() -> dict:
 
 
 # Keys whose config-file values live in [congestion] rather than [params]
-_CONGESTION_KEYS = {"lambda_cong_init", "lambda_cong_ramp"}
+_CONGESTION_KEYS = {"lambda_cong_init", "lambda_cong_ramp", "lambda_cong_target"}
 
 def default_individual(base_config: dict) -> dict:
     """Return a gene dict populated from base_config values (clamped to gene ranges)."""
@@ -178,7 +177,10 @@ def tournament(population: list[dict], fitnesses: list[float], k: int) -> dict:
 def _evaluate(ind: dict, benchmark, base_config: dict, run_idx: int) -> tuple[float, dict]:
     """Run one CometPlacer with ind's genes injected; return (fitness, costs)."""
     cfg = copy.deepcopy(base_config)
-    cfg.setdefault("params", {}).update(ind)
+    params_genes = {k: v for k, v in ind.items() if k not in _CONGESTION_KEYS}
+    cong_genes   = {k: v for k, v in ind.items() if k in _CONGESTION_KEYS}
+    cfg.setdefault("params", {}).update(params_genes)
+    cfg.setdefault("congestion", {}).update(cong_genes)
     cfg.setdefault("output", {}).update({"record_frames": False, "quiet": True})
     cfg.setdefault("ga", {})["ga_enable"] = False   # prevent recursive GA instantiation
 
@@ -232,6 +234,7 @@ class GACometPlacer:
         self.mut_rate   = float(ga.get("mut_rate",       GA_DEFAULTS["mut_rate"]))
         self.rng_seed   = int(ga.get("seed",             GA_DEFAULTS["seed"]))
         self.time_limit = float(ga.get("time_limit_mins", 55)) * 60
+        self.final_seeds = list(ga.get("final_seeds", []))
 
     def place(self, benchmark):
         random.seed(self.rng_seed)
@@ -266,10 +269,14 @@ class GACometPlacer:
             for i, ind in enumerate(population):
                 elapsed_so_far = time.perf_counter() - t_total
                 avg_run = sum(run_times) / len(run_times) if run_times else 0.0
-                if run_times and elapsed_so_far + avg_run > time_limit:
+                seed_sweep_reserve = len(self.final_seeds) * avg_run
+                ga_budget = time_limit - seed_sweep_reserve
+                if run_times and elapsed_so_far + avg_run > ga_budget:
                     print(
                         f"  [GA] Time limit: {elapsed_so_far/60:.1f}m elapsed + "
-                        f"{avg_run:.0f}s avg run would exceed 55m — stopping early"
+                        f"{avg_run:.0f}s avg run would exceed GA budget "
+                        f"({ga_budget/60:.1f}m of {time_limit/60:.0f}m total; "
+                        f"{seed_sweep_reserve/60:.1f}m reserved for final seed sweep) — stopping early"
                     )
                     timed_out = True
                     break
@@ -332,6 +339,34 @@ class GACometPlacer:
 
             population = new_pop
             fitnesses  = [float("inf")] * self.pop_size
+
+        # Final seed sweep over the best gene set found by GA
+        if best_genes and self.final_seeds:
+            print(f"\n{'─'*60}")
+            print(f"  [GA] Final seed sweep — best_genes × {len(self.final_seeds)} seeds")
+            print(f"{'─'*60}")
+            for s in self.final_seeds:
+                run_idx += 1
+                ind = {**best_genes, "seed": s}
+                print(f"  [seed-sweep] run {run_idx:3d} | seed={s}")
+                try:
+                    fitness, costs = _evaluate(ind, benchmark, self._base_config, run_idx)
+                except Exception as exc:
+                    print(f"  [seed-sweep] run {run_idx} FAILED: {exc}", file=sys.stderr)
+                    fitness, costs = float("inf"), {}
+                self._append_history(history_path, -1, s, run_idx, ind, fitness, costs)
+                tag = "  ← best!" if fitness < best_fitness else ""
+                print(
+                    f"  [seed-sweep] run {run_idx:3d} → fitness={fitness:.4f}  "
+                    f"proxy={costs.get('proxy_cost', float('nan')):.4f}  "
+                    f"overlaps={costs.get('overlap_count', '?')}  "
+                    f"({costs.get('elapsed', 0):.1f}s){tag}"
+                )
+                if fitness < best_fitness:
+                    best_fitness = fitness
+                    best_pos     = costs.get("placement")
+                    best_costs   = costs
+                    best_genes   = ind
 
         print(
             f"\n  [GA] Done — {run_idx} total runs  "
