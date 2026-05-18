@@ -32,15 +32,16 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 GENE_SPACE: dict[str, tuple] = {
-    "lambda_den_init":               ("log",    1e-3,  3e-1),
-    "halo_size":                     ("linear", 0.0,   0.5),
-    "max_step":                      ("linear", 0.002, 0.010),
-    "gamma_decay":                   ("linear", 0.988, 0.998),
+    "lambda_den_init":               ("log",    1e-7,  1e-4),
+    "halo_size":                     ("linear", 0.16,   0.32),
+    "max_step":                      ("linear", 0.003, 0.008),
     "target_density":                ("linear", 0.60,  0.80),
-    "mGP_hard_macro_density_weight": ("linear", 0.8,   2.0),
-    "mGP_soft_macro_density_weight": ("linear", 0.5,   1.2),
-    "initial_placement":             ("choice", ["none", "center", "quadratic"]),
-    "rotation_optimizer":            ("choice", ["none", "greedy"]),
+    "mGP_hard_macro_density_weight": ("linear", 0.5,   1.5),
+    #"cGP_enable":                   ("choice", [False, True]),
+    "seed":                          ("choice", [1, 2, 3, 42, 67, 69, 420, 6969]),
+    "lambda_cong_target":              ("linear", 0.25,   0.38),
+    "largest_macro_starting_section": ("choice", [1, 2, 3, 6]),  
+    "quad_scatter_lock_mult":       ("log", 1e5, 1e7),
 }
 
 # ---------------------------------------------------------------------------
@@ -63,7 +64,7 @@ OVERLAP_PENALTY = 10.0   # added to proxy when overlaps > 0
 # Individual representation
 # ---------------------------------------------------------------------------
 
-def _sample(gene_spec: tuple) -> float | str:
+def _sample(gene_spec: tuple) -> float | int | str:
     kind = gene_spec[0]
     if kind == "linear":
         _, lo, hi = gene_spec
@@ -71,12 +72,17 @@ def _sample(gene_spec: tuple) -> float | str:
     elif kind == "log":
         _, lo, hi = gene_spec
         return math.exp(random.uniform(math.log(lo), math.log(hi)))
+    elif kind == "int":
+        _, lo, hi = gene_spec
+        return random.randint(int(lo), int(hi))
     else:  # choice
         return random.choice(gene_spec[1])
 
 
 def _clamp(val, gene_spec: tuple):
     kind = gene_spec[0]
+    if kind == "int":
+        return int(max(gene_spec[1], min(gene_spec[2], round(val))))
     if kind in ("linear", "log"):
         return max(gene_spec[1], min(gene_spec[2], val))
     return val
@@ -84,6 +90,23 @@ def _clamp(val, gene_spec: tuple):
 
 def sample_individual() -> dict:
     return {k: _sample(spec) for k, spec in GENE_SPACE.items()}
+
+
+# Keys whose config-file values live in [congestion] rather than [params]
+_CONGESTION_KEYS = {"lambda_cong_init", "lambda_cong_ramp"}
+
+def default_individual(base_config: dict) -> dict:
+    """Return a gene dict populated from base_config values (clamped to gene ranges)."""
+    params = base_config.get("params", {})
+    cong   = base_config.get("congestion", {})
+    ind = {}
+    for k, spec in GENE_SPACE.items():
+        section = cong if k in _CONGESTION_KEYS else params
+        val = section.get(k)
+        if val is None:
+            val = _sample(spec)   # gene not in config — fall back to random
+        ind[k] = _clamp(val, spec)
+    return ind
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +119,9 @@ def crossover(a: dict, b: dict) -> dict:
         kind = spec[0]
         if kind == "choice":
             child[k] = random.choice([a[k], b[k]])
+        elif kind == "int":
+            alpha = random.uniform(-0.25, 1.25)
+            child[k] = _clamp(alpha * a[k] + (1 - alpha) * b[k], spec)
         elif kind == "linear":
             alpha = random.uniform(-0.25, 1.25)   # BLX-style, allows extrapolation
             child[k] = _clamp(alpha * a[k] + (1 - alpha) * b[k], spec)
@@ -120,6 +146,10 @@ def mutate(ind: dict, rate: float) -> dict:
         kind = spec[0]
         if kind == "choice":
             out[k] = random.choice(spec[1])
+        elif kind == "int":
+            _, lo, hi = spec
+            sigma = max(1, (hi - lo) * 0.1)
+            out[k] = _clamp(ind[k] + random.gauss(0, sigma), spec)
         elif kind == "linear":
             _, lo, hi = spec
             sigma = (hi - lo) * 0.1
@@ -192,18 +222,27 @@ class GACometPlacer:
         if config is None:
             config = _load_config()
         self._base_config = config
+        n_sec = int(config.get("params", {}).get("quad_scatter_section_count", 4))
+        GENE_SPACE["largest_macro_starting_section"] = ("int", 1, max(1, n_sec))
         ga = config.get("ga", {})
         self.pop_size  = int(ga.get("pop_size",  GA_DEFAULTS["pop_size"]))
         self.n_gens    = int(ga.get("n_gens",    GA_DEFAULTS["n_gens"]))
         self.elite_k   = int(ga.get("elite_k",   GA_DEFAULTS["elite_k"]))
         self.tourn_k   = int(ga.get("tourn_k",   GA_DEFAULTS["tourn_k"]))
-        self.mut_rate  = float(ga.get("mut_rate", GA_DEFAULTS["mut_rate"]))
-        self.rng_seed  = int(ga.get("seed",       GA_DEFAULTS["seed"]))
+        self.mut_rate   = float(ga.get("mut_rate",       GA_DEFAULTS["mut_rate"]))
+        self.rng_seed   = int(ga.get("seed",             GA_DEFAULTS["seed"]))
+        self.time_limit = float(ga.get("time_limit_mins", 55)) * 60
 
     def place(self, benchmark):
         random.seed(self.rng_seed)
 
-        population = [sample_individual() for _ in range(self.pop_size)]
+        history_path = self._history_path(benchmark.name)
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        history_path.write_text("")  # truncate any prior history
+
+        population = [default_individual(self._base_config)] + [
+            sample_individual() for _ in range(self.pop_size - 1)
+        ]
         fitnesses  = [float("inf")] * self.pop_size
 
         best_fitness  = float("inf")
@@ -211,6 +250,9 @@ class GACometPlacer:
         best_costs    = None
         best_genes    = None
         run_idx       = 0
+        run_times     = []
+        time_limit    = self.time_limit
+        timed_out     = False
 
         t_total = time.perf_counter()
 
@@ -222,6 +264,16 @@ class GACometPlacer:
             print(f"{'─'*60}")
 
             for i, ind in enumerate(population):
+                elapsed_so_far = time.perf_counter() - t_total
+                avg_run = sum(run_times) / len(run_times) if run_times else 0.0
+                if run_times and elapsed_so_far + avg_run > time_limit:
+                    print(
+                        f"  [GA] Time limit: {elapsed_so_far/60:.1f}m elapsed + "
+                        f"{avg_run:.0f}s avg run would exceed 55m — stopping early"
+                    )
+                    timed_out = True
+                    break
+
                 run_idx += 1
                 genes_str = "  ".join(
                     f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}"
@@ -233,12 +285,14 @@ class GACometPlacer:
                     fitness, costs = _evaluate(
                         ind, benchmark, self._base_config, run_idx
                     )
+                    run_times.append(costs.get("elapsed", 0.0))
                 except Exception as exc:
                     print(f"  [GA] run {run_idx} FAILED: {exc}", file=sys.stderr)
                     fitness = float("inf")
                     costs   = {}
 
                 fitnesses[i] = fitness
+                self._append_history(history_path, gen, i, run_idx, ind, fitness, costs)
                 tag = "  ← best!" if fitness < best_fitness else ""
                 print(
                     f"  [GA] run {run_idx:3d} → fitness={fitness:.4f}  "
@@ -262,7 +316,7 @@ class GACometPlacer:
                 f"time={time.perf_counter()-t_gen:.1f}s"
             )
 
-            if gen == self.n_gens - 1:
+            if timed_out or gen == self.n_gens - 1:
                 break
 
             # Evolve: elitism + tournament + crossover + mutation
@@ -301,13 +355,44 @@ class GACometPlacer:
         return best_pos
 
 
-    def _write_results(self, bench_name, total_runs, elapsed,
-                       best_fitness, best_costs, best_genes):
-        frames_dir = Path(
+    def _out_dir(self, bench_name: str) -> Path:
+        import os
+        env_config = os.environ.get("MSPLACER_CONFIG")
+        if env_config:
+            return Path(env_config).parent
+        return Path(
             self._base_config.get("output", {}).get("frames_dir", "vis/frames")
         ) / bench_name
-        frames_dir.mkdir(parents=True, exist_ok=True)
-        out = frames_dir / "ga_results.txt"
+
+    def _history_path(self, bench_name: str) -> Path:
+        return self._out_dir(bench_name) / "ga_history.jsonl"
+
+    @staticmethod
+    def _append_history(path: Path, gen: int, ind_idx: int, run_idx: int,
+                        genes: dict, fitness: float, costs: dict) -> None:
+        import json, math
+        fit = fitness if math.isfinite(fitness) else None
+        record = {
+            "gen": gen,
+            "ind": ind_idx,
+            "run": run_idx,
+            "fitness": fit,
+            "proxy": costs.get("proxy_cost"),
+            "wl": costs.get("wirelength_cost"),
+            "density": costs.get("density_cost"),
+            "cong": costs.get("congestion_cost"),
+            "overlaps": costs.get("overlap_count"),
+            "elapsed": costs.get("elapsed"),
+            "genes": genes,
+        }
+        with open(path, "a") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+
+    def _write_results(self, bench_name, total_runs, elapsed,
+                       best_fitness, best_costs, best_genes):
+        out_dir = self._out_dir(bench_name)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out = out_dir / "ga_results.txt"
 
         lines = [
             f"benchmark   : {bench_name}",

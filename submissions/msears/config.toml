@@ -4,7 +4,7 @@
 
 [params]
 # ── Phase 1: mIP — Macro Initial Placement ────────────────────────────────
-initial_placement        = "center"   # "none", "center", or "quadratic"
+initial_placement        = "quadratic"   # "none", "center", or "quadratic"
 center_init_spread       = 0.05    # fraction of canvas area for center-scatter radius (only used when initial_placement = "center")
 quad_b2b_iters           = 6       # B2B refinement passes after CLIQUE warm-start (0 = CLIQUE only)
 quad_net_size_threshold  = 50      # nets larger than this use star model instead of CLIQUE
@@ -12,8 +12,9 @@ quad_anchor_fraction     = 0       # (0 = disabled)fraction of movable macros (r
 quad_scatter_n           = 0         # (0 = disabled) scatter+lock exactly N largest hard macros; overrides quad_scatter_fraction when non-zero
 quad_scatter_fraction   = 0.1       # (0 = disabled) scatter+lock largest macros until their cumulative area >= this fraction of total movable area
 quad_scatter_lock_mult   = 1e6      # (0 = disabled) keep scatter macros fixed in mGP until lambda >= this × lambda_0
-quad_scatter_section_count    = 1   # divide die into N sections for largest scatter macro (1 = disabled)
+quad_scatter_section_count    = 8   # divide die into N sections for largest scatter macro (1 = disabled)
 quad_scatter_runs_per_section = 1   # placement runs per section; total runs = section_count × runs_per_section
+largest_macro_starting_section = 1  # 0 = use multi-section sweep; 1..N = GA gene pins largest macro to this section
 
 # ── Phase 2: mGP — Mixed Global Placement ─────────────────────────────────
 mgp_enable            = true            # phase 2: run mixed global placement (set false to skip mGP entirely)
@@ -42,7 +43,7 @@ divergence_window  = 50     # stop if overflow rising AND wl > 5× best wl (last
 lambda_den_schedule         = "hpwl"  # "hpwl" (feedback) or "geometric" (fixed ramp)
 
 # hpwl mode
-lambda_den_init             = 8e-2
+lambda_den_init             = 8e-5
 lambda_den_pcof_upper       = 1.05   # multiplier when overflow is NOT improving (ramp hard)
 lambda_den_pcof_lower       = 1.01   # multiplier when overflow IS actively decreasing (gentle ramp)
 
@@ -100,6 +101,7 @@ cGP_enable                    = false # enable phase 4
 cGP_iters                     = 5000   # max iterations (early stopping applies)
 cGP_position_reset            = false  # reset soft macros to canvas center before cGP
 cGP_hard_macro_density_weight = 1.0  # hard macro charge weight in cGP density map (0 = exclude, 1 = full, intermediate = partial)
+cGP_soft_macro_density_weight = 1.0  # soft macro charge weight in cGP density map (<1 = weaker repulsion)
 
 # ── Convergence checks (apply to both mGP and cGP) ────────────────────────
 # Disable individually to isolate their effect (all default true).
@@ -118,13 +120,14 @@ elite_k    = 2       # top-k individuals carried unchanged to next generation
 tourn_k    = 3       # tournament selection size
 mut_rate   = 0.25    # per-gene mutation probability
 seed       = 0       # RNG seed for GA (independent of placer seed)
+time_limit_mins = 55 # stop before starting a new run if elapsed + avg_run would exceed this
 
 [congestion]
 cong_rudy_enable    = true   # compute RUDY congestion map after placement (diagnostic only for now)
 cong_rudy_grid_size = 64     # grid resolution (square); independent of density_grid_size
-lambda_cong_init           = 0.32    # congestion force as a fraction of density force (0 = disabled)
-                                    # e.g. 0.5 means congestion gradient = 0.5 × density gradient at init
-lambda_cong_ramp           = 1.05   # per-iter multiplier ramping lambda_cong_eff from 1% → target (~94 iters)
+lambda_cong_target         = 3.2    # calibration scale: target = lambda_cong_target × wl_grad_max / cong_grad_max (0 = disabled)
+lambda_cong_init           = 0.01   # starting fraction of calibrated target: lambda_cong_eff = target * lambda_cong_init
+lambda_cong_ramp           = 1.05   # per-iter multiplier ramping lambda_cong_eff from init → target
 cong_start_overflow        = 0.4   # overflow threshold below which congestion gradient activates (Xplace default)
 
 [output]

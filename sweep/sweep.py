@@ -108,7 +108,7 @@ SWEEP = {
     #"quad_scatter_runs_per_section": [16], # number of mGP runs to perform per section in quadrant scatter (0 = disabled; try 1 or more for best results, especially with higher quad_scatter_section_count)
     #"mGP_hard_macro_density_weight": [ 1.2], # charge weight for hard macros in mGP density map (>1 = stronger repulsion)
     #"mGP_soft_macro_density_weight": [ 0.8], # charge weight for soft macros in mGP density map (<1 = weaker repulsion)
-    "ga_enable": ["True", "False"],
+    "ga_enable": ["True"],
 }
 # ─────────────────────────────────────────────────────────────────────────────
 

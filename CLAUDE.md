@@ -155,45 +155,53 @@ Hard macros only. ibm01: 246 hard + 894 soft = 1140 total, 5993 nets.
 ### NG45 — `external/MacroPlacement/Flows/NanGate45/{design}/netlist/output_CT_Grouping/`
 Mix of hard and soft. ariane133: 133 hard + 782 soft macros.
 
-## Current results (ibm01)
-```
-# Pre-legalization greedy rotation, all 8 orientations, macro_sizes swap (current best):
-proxy≈0.898  (0 overlaps)
-```
-
-## All-benchmark results (best config, 17 IBM benchmarks)
-```
-rank  avg_proxy   n_bench    params
-1     1.4431      17         rotation_optimizer=greedy  ← last measured all-bench
-```
-Status: QUALIFIED (0 overlaps). ibm01 improved from ~1.04 to ~0.99 with rotation refactor.
-
 ## Best results per benchmark (valid runs only, 0 overlaps)
 
-These are the best proxy scores observed across all sweeps (including random seeds).
 Updated: 2026-05-16.
 
-| benchmark | proxy  | wl     | density | congestion | sweep / run                        |
-|-----------|--------|--------|---------|------------|------------------------------------|
-| ibm01     | 0.8981 | 0.0680 | 0.5510  | 1.1090     | sweep_20260516T025405Z / run_001   |
-| ibm02     | 1.3195 | 0.0984 | 0.5927  | 1.8495     | sweep_20260504T142134Z / run_042   |
-| ibm03     | 1.2021 | 0.1121 | 0.5470  | 1.6329     | sweep_20260502T002144Z / run_019   |
-| ibm04     | 1.1467 | 0.0921 | 0.5483  | 1.5610     | sweep_20260504T142134Z / run_043   |
-| ibm06     | 1.5793 | 0.1072 | 0.5849  | 2.3593     | sweep_20260502T002144Z / run_031   |
-| ibm07     | 1.3017 | 0.0834 | 0.5346  | 1.9019     | sweep_20260501T203044Z / run_013   |
-| ibm08     | 1.4220 | 0.0829 | 0.5815  | 2.0968     | sweep_20260501T184921Z / run_001   |
-| ibm09     | 0.9860 | 0.0716 | 0.5802  | 1.2486     | sweep_20260502T002144Z / run_002   |
-| ibm10     | 1.3112 | 0.0758 | 0.6504  | 1.8205     | sweep_20260501T184659Z / run_002   |
-| ibm11     | 1.0626 | 0.0704 | 0.5542  | 1.4303     | sweep_20260501T203044Z / run_015   |
-| ibm12     | 1.5020 | 0.0882 | 0.6041  | 2.2235     | sweep_20260502T002144Z / run_026   |
-| ibm13     | 1.1279 | 0.0702 | 0.5471  | 1.5684     | sweep_20260501T203044Z / run_015   |
-| ibm14     | 1.4493 | 0.0632 | 0.5675  | 2.2047     | sweep_20260502T002144Z / run_032   |
-| ibm15     | 1.4243 | 0.0732 | 0.5820  | 2.1202     | sweep_20260501T203044Z / run_014   |
-| ibm16     | 1.4029 | 0.0652 | 0.5502  | 2.1251     | sweep_20260502T002144Z / run_018   |
-| ibm17     | 1.5643 | 0.0616 | 0.6366  | 2.3688     | sweep_20260501T184921Z / run_003   |
-| ibm18     | 1.7328 | 0.0636 | 0.7062  | 2.6321     | sweep_20260501T184921Z / run_001   |
+| benchmark | proxy  | wl     | density | congestion | sweep                          |
+|-----------|--------|--------|---------|------------|--------------------------------|
+| ibm01     | 0.8981 | 0.0680 | 0.5510  | 1.1090     | sweep_20260516T025405Z         |
+| ibm02     | 1.3614 | 0.0940 | 0.5600  | 1.9760     | sweep_20260516T025405Z         |
+| ibm03     | 1.1987 | 0.1140 | 0.5610  | 1.6090     | sweep_20260516T025405Z         |
+| ibm04     | 1.1304 | 0.0910 | 0.6140  | 1.4640     | sweep_20260516T025405Z         |
+| ibm06     | 1.4512 | 0.0920 | 0.5550  | 2.1620     | sweep_20260516T025405Z         |
+| ibm07     | 1.2672 | 0.0840 | 0.5550  | 1.8120     | sweep_20260516T025405Z         |
+| ibm08     | 1.3293 | 0.0850 | 0.5300  | 1.9590     | sweep_20260516T025405Z         |
+| ibm09     | 0.9586 | 0.0680 | 0.5710  | 1.2100     | sweep_20260516T025405Z         |
+| ibm10     | 1.3268 | 0.0820 | 0.6820  | 1.8070     | sweep_20260516T025405Z         |
+| ibm11     | 1.0288 | 0.0660 | 0.5920  | 1.3330     | sweep_20260516T025405Z         |
+| ibm12     | 1.5129 | 0.0930 | 0.6300  | 2.2100     | sweep_20260516T025405Z         |
+| ibm13     | 1.1076 | 0.0670 | 0.5770  | 1.5040     | sweep_20260516T025405Z         |
+| ibm14     | 1.4543 | 0.0610 | 0.7080  | 2.0780     | sweep_20260516T025405Z         |
+| ibm15     | 1.4202 | 0.0770 | 0.6320  | 2.0540     | sweep_20260516T025405Z         |
+| ibm16     | 1.4197 | 0.0680 | 0.5900  | 2.1130     | sweep_20260516T025405Z         |
+| ibm17     | 1.5680 | 0.0630 | 0.7100  | 2.3010     | sweep_20260516T025405Z         |
+| ibm18     | 1.6552 | 0.0700 | 0.7480  | 2.4230     | sweep_20260516T025405Z         |
 
-To regenerate: `uv run python scripts/_best_results.py`
+## GA best results per benchmark (valid runs only, 0 overlaps)
+
+Updated: 2026-05-16.
+
+| benchmark | proxy  | wl     | density | congestion | sweep                          |
+|-----------|--------|--------|---------|------------|--------------------------------|
+| ibm01     | 0.9119 | 0.0730 | 0.5560  | 1.1230     | sweep_20260516T045130Z         |
+| ibm02     | 1.3711 | 0.0990 | 0.5990  | 1.9450     | sweep_20260516T045130Z         |
+| ibm03     | 1.1686 | 0.1030 | 0.5550  | 1.5760     | sweep_20260516T045130Z         |
+| ibm04     | 1.1325 | 0.0890 | 0.5830  | 1.5040     | sweep_20260516T045130Z         |
+| ibm06     | 1.3809 | 0.0860 | 0.6660  | 1.9230     | sweep_20260516T045130Z         |
+| ibm07     | 1.2949 | 0.0830 | 0.6440  | 1.7800     | sweep_20260516T045130Z         |
+| ibm08     | 1.3951 | 0.0830 | 0.5850  | 2.0380     | sweep_20260516T045130Z         |
+| ibm09     | 0.9714 | 0.0680 | 0.5710  | 1.2360     | sweep_20260516T045130Z         |
+| ibm10     | 1.3469 | 0.0840 | 0.6870  | 1.8400     | sweep_20260516T045130Z         |
+| ibm11     | 1.0296 | 0.0660 | 0.6070  | 1.3200     | sweep_20260516T045130Z         |
+| ibm12     | 1.4817 | 0.0910 | 0.6240  | 2.1570     | sweep_20260516T045130Z         |
+| ibm13     | 1.1619 | 0.0650 | 0.5720  | 1.6210     | sweep_20260516T045130Z         |
+| ibm14     | 1.4354 | 0.0620 | 0.5740  | 2.1730     | sweep_20260516T045130Z         |
+| ibm15     | 1.4127 | 0.0720 | 0.5990  | 2.0820     | sweep_20260516T045130Z         |
+| ibm16     | 1.3951 | 0.0640 | 0.5940  | 2.0680     | sweep_20260516T045130Z         |
+| ibm17     | 1.6868 | 0.0660 | 0.5990  | 2.6420     | sweep_20260516T045130Z         |
+| ibm18     | 1.6896 | 0.0720 | 0.5970  | 2.6370     | sweep_20260516T045130Z         |
 
 ## Rotation optimizer design
 
@@ -260,17 +268,6 @@ Avoids external DCT libraries. Spectral constants cached per grid shape.
 **Sign convention:** the potential φ has a maximum at density peaks (∇²φ=ρ with Neumann BCs). The repulsive spreading gradient is `den_grad = -E = +∇φ`, so `_density_gradient_electrostatic` returns `(-Ex, -Ey)` from the Poisson solver.
 
 ## Shelved / other branches
-
-### `genetic_init` branch
-GA for joint scatter-macro position + orientation search. Each chromosome encodes
-orientations (scatter macros only) + initial (x, y) positions. Fitness = WL after
-a full placement with scatter macros pinned at chromosome positions. Shelved because
-the non-GA pipeline (greedy rotation + mLG) reaches ~0.99 proxy on ibm01 with 0
-overlaps; GA adds significant runtime complexity for uncertain gain.
-
-Key files on that branch:
-- `submissions/msears/genetic.py` — `Chromosome`, `GeneticPlacer`, `PlacementEvalFn`
-- `placer.py` — `_runGa`, `_buildFullEvalConfig`
 
 ### NOT yet implemented
 - Nesterov momentum + BB step size

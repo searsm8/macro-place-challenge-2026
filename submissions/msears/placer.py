@@ -420,7 +420,8 @@ class CometPlacer:
 
         self.cong_rudy_enable    = _asBool(cong_cfg.get("cong_rudy_enable", False))
         self.cong_rudy_grid_size = int(cong_cfg.get("cong_rudy_grid_size", 32))
-        self.lambda_cong_init            = float(cong_cfg.get("lambda_cong_init", 0.0))
+        self.lambda_cong_target          = float(cong_cfg.get("lambda_cong_target", 0.0))
+        self.lambda_cong_init            = float(cong_cfg.get("lambda_cong_init", 0.01))
         self.lambda_cong_ramp            = float(cong_cfg.get("lambda_cong_ramp", 1.05))
         self.cong_start_overflow         = float(cong_cfg.get("cong_start_overflow", 0.2))
 
@@ -456,6 +457,7 @@ class CometPlacer:
         self.cgp_enable = _asBool(p.get("cGP_enable", p.get("soft_place", False)))
         self.cgp_position_reset = _asBool(p.get("cGP_position_reset", False))
         self.cgp_hard_macro_density_weight = float(p.get("cGP_hard_macro_density_weight", 1.0))
+        self.cgp_soft_macro_density_weight = float(p.get("cGP_soft_macro_density_weight", 1.0))
         self.hard_macro_density_weight = float(p.get("mGP_hard_macro_density_weight", 1.0))
         self.soft_macro_density_weight = float(p.get("mGP_soft_macro_density_weight", 1.0))
         self.hard_spread = _asBool(p.get("hard_spread", False))
@@ -525,6 +527,7 @@ class CometPlacer:
         self.scatter_lock_mult      = p.get("quad_scatter_lock_mult", 0.0)
         self.quad_scatter_section_count    = int(p.get("quad_scatter_section_count", 1))
         self.quad_scatter_runs_per_section = int(p.get("quad_scatter_runs_per_section", 1))
+        self.largest_macro_starting_section = int(p.get("largest_macro_starting_section", 0))
         # Runtime section context — updated per run in multi-section mode
         self._section_idx   = 0
         self._section_count = 1
@@ -1234,6 +1237,7 @@ class CometPlacer:
             "lambda_hm": 1.0,         # no hard-macro boost; they're fixed anyway
             "hard_mask": benchmark.get_hard_macro_mask().to(self.device),
             "hard_macro_weight": self.cgp_hard_macro_density_weight,
+            "soft_macro_weight": self.cgp_soft_macro_density_weight,
             "best_wl": float("inf"),
             "best_pos": pos.clone(),
             "prev_wl": float("inf"),
@@ -1474,8 +1478,10 @@ class CometPlacer:
                    "quad_scatter_n": self.quad_scatter_n,
                    "quad_scatter_fraction": self.quad_scatter_fraction,
                    "seed": self.seed,
-                   "quad_scatter_section_count": self._section_count,
-                   "quad_scatter_section_idx":   self._section_idx}
+                   "quad_scatter_section_count": max(self._section_count, self.largest_macro_starting_section),
+                   "quad_scatter_section_idx":   (self.largest_macro_starting_section - 1
+                                                   if self.largest_macro_starting_section > 0
+                                                   else self._section_idx)}
             self._out.log("  Quadratic WL init (mIP)...", flush=True)
             # quadratic_placer uses numpy/scipy and requires CPU tensors.
             cpu_net_data = {k: v.cpu() if isinstance(v, torch.Tensor) else v
@@ -1617,7 +1623,7 @@ class CometPlacer:
         lambda_cong_eff then ramps from 1% of target toward target by lambda_cong_ramp
         each iteration, so congestion activates gradually rather than with a hard jolt.
         """
-        if self.lambda_cong_init <= 0.0 or t < self.warmup_iters or overflow > self.cong_start_overflow:
+        if self.lambda_cong_target <= 0.0 or t < self.warmup_iters or overflow > self.cong_start_overflow:
             return None
         rudy = _congestion.compute_rudy_map(
             eval_pos, net_data,
@@ -1632,9 +1638,9 @@ class CometPlacer:
         if state["lambda_cong_target"] == 0.0:
             wl_max   = wl_grad.abs().max().item()
             cong_max = cong_grad.abs().max().item()
-            target   = self.lambda_cong_init * wl_max / (cong_max + 1e-8)
+            target   = self.lambda_cong_target * wl_max / (cong_max + 1e-8)
             state["lambda_cong_target"] = target
-            state["lambda_cong_eff"]    = target * 0.01
+            state["lambda_cong_eff"]    = target * self.lambda_cong_init
             self._out.log(
                 f"  cong activated: target={target:.3e}  "
                 f"(wl_max={wl_max:.3e}  cong_max={cong_max:.3e})  ramp={self.lambda_cong_ramp}"

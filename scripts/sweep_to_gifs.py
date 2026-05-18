@@ -144,7 +144,7 @@ def render_run(
         print(f"  skip  {run_dir.relative_to(REPO_ROOT)}  (no frames after step={args.step})")
         return False
 
-    cfg_names, cfg_n_random, _cfg_n_scatter, _cfg_n_io = ftg._load_visualizer_config()
+    cfg_names, cfg_n_random, _cfg_n_scatter, _cfg_n_io, *_ = ftg._load_visualizer_config()
     highlight_ids = ftg.resolve_highlight_ids(benchmark, cfg_names, cfg_n_random) or None
 
     pil_frames: list[Image.Image] = []
