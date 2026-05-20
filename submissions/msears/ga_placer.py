@@ -32,15 +32,13 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 GENE_SPACE: dict[str, tuple] = {
-    "halo_size":                     ("linear", 0.16,   0.32),
-    "max_step":                      ("linear", 0.003, 0.008),
+    "halo_size":                     ("linear", 0.10,  0.25),
+    "max_step":                      ("linear", 0.003, 0.007),
     "target_density":                ("linear", 0.60,  0.80),
-    "mGP_hard_macro_density_weight": ("linear", 0.9,   1.5),
-    #"cGP_enable":                   ("choice", [False, True]),
-    #"seed":                          ("choice", [0, 2, 420, 6969]), # Give the GA a few different random seeds to choose from
+    "mGP_hard_macro_density_weight": ("linear", 1.0,   1.4),
     "lambda_den_init":               ("log",    8e-6,  1e-3),
-    "lambda_cong_target":              ("linear", 0.25,   0.38),
-    "quad_scatter_lock_mult":       ("log", 1e5, 1e6),
+    "lambda_cong_target":            ("linear", 0.25,  0.38),
+    "quad_scatter_lock_mult":        ("log",    1e5,   3e6),
 }
 
 # ---------------------------------------------------------------------------
@@ -48,8 +46,8 @@ GENE_SPACE: dict[str, tuple] = {
 # ---------------------------------------------------------------------------
 
 GA_DEFAULTS = {
-    "pop_size":  8,
-    "n_gens":    5,
+    "pop_size":  16,
+    "n_gens":    4,
     "elite_k":   2,
     "tourn_k":   3,
     "mut_rate":  0.15,
@@ -235,6 +233,8 @@ class GACometPlacer:
         self.rng_seed   = int(ga.get("seed",             GA_DEFAULTS["seed"]))
         self.time_limit = float(ga.get("time_limit_mins", 55)) * 60
         self.final_seeds = list(ga.get("final_seeds", []))
+        raw = ga.get("perform_seed_sweep", False)
+        self.perform_seed_sweep = raw if isinstance(raw, bool) else str(raw).lower() == "true"
 
     def place(self, benchmark):
         random.seed(self.rng_seed)
@@ -269,14 +269,10 @@ class GACometPlacer:
             for i, ind in enumerate(population):
                 elapsed_so_far = time.perf_counter() - t_total
                 avg_run = sum(run_times) / len(run_times) if run_times else 0.0
-                seed_sweep_reserve = len(self.final_seeds) * avg_run
-                ga_budget = time_limit - seed_sweep_reserve
-                if run_times and elapsed_so_far + avg_run > ga_budget:
+                if run_times and elapsed_so_far + avg_run > time_limit:
                     print(
                         f"  [GA] Time limit: {elapsed_so_far/60:.1f}m elapsed + "
-                        f"{avg_run:.0f}s avg run would exceed GA budget "
-                        f"({ga_budget/60:.1f}m of {time_limit/60:.0f}m total; "
-                        f"{seed_sweep_reserve/60:.1f}m reserved for final seed sweep) — stopping early"
+                        f"{avg_run:.0f}s avg run would exceed {time_limit/60:.0f}m limit — stopping early"
                     )
                     timed_out = True
                     break
@@ -341,11 +337,19 @@ class GACometPlacer:
             fitnesses  = [float("inf")] * self.pop_size
 
         # Final seed sweep over the best gene set found by GA
-        if best_genes and self.final_seeds:
+        if best_genes and self.final_seeds and self.perform_seed_sweep:
             print(f"\n{'─'*60}")
             print(f"  [GA] Final seed sweep — best_genes × {len(self.final_seeds)} seeds")
             print(f"{'─'*60}")
             for s in self.final_seeds:
+                elapsed_so_far = time.perf_counter() - t_total
+                avg_run = sum(run_times) / len(run_times) if run_times else 0.0
+                if run_times and elapsed_so_far + avg_run > time_limit:
+                    print(
+                        f"  [seed-sweep] Time limit: {elapsed_so_far/60:.1f}m elapsed + "
+                        f"{avg_run:.0f}s avg run would exceed {time_limit/60:.0f}m limit — stopping early"
+                    )
+                    break
                 run_idx += 1
                 ind = {**best_genes, "seed": s}
                 print(f"  [seed-sweep] run {run_idx:3d} | seed={s}")

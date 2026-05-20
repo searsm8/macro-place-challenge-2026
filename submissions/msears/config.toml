@@ -12,9 +12,9 @@ quad_anchor_fraction     = 0       # (0 = disabled)fraction of movable macros (r
 quad_scatter_n           = 0         # (0 = disabled) scatter+lock exactly N largest hard macros; overrides quad_scatter_fraction when non-zero
 quad_scatter_fraction   = 0.1       # (0 = disabled) scatter+lock largest macros until their cumulative area >= this fraction of total movable area
 quad_scatter_lock_mult   = 1e6      # (0 = disabled) keep scatter macros fixed in mGP until lambda >= this × lambda_0
-quad_scatter_section_count    = 8   # divide die into N sections for largest scatter macro (1 = disabled)
-quad_scatter_runs_per_section = 1   # placement runs per section; total runs = section_count × runs_per_section
-largest_macro_starting_section = 1  # 0 = use multi-section sweep; 1..N = GA gene pins largest macro to this section
+quad_scatter_section_count    = 4   # divide die into N sections for largest scatter macro (1 = disabled)
+quad_scatter_runs_per_section = 4   # placement runs per section; total runs = section_count × runs_per_section
+largest_macro_starting_section = 0  # 0 = use multi-section sweep; 1..N = GA gene pins largest macro to this section
 
 # ── Phase 2: mGP — Mixed Global Placement ─────────────────────────────────
 mgp_enable            = true            # phase 2: run mixed global placement (set false to skip mGP entirely)
@@ -63,7 +63,7 @@ lambda_hm_init  = 1.0    # initial hard-macro density boost (1.0 = disabled); de
 lambda_hm_decay = 0.995  # per-iter decay toward 1.0
 
 # ── mGP macro halos ───────────────────────────────────────────────────────
-halo_size     = 0.2   # inflate hard macro footprints in density map by this fraction (0 = disabled); e.g. 0.1 → (1.1w)×(1.1h), charge conserved via area_ratio
+halo_size     = 0.18   # inflate hard macro footprints in density map by this fraction (0 = disabled); e.g. 0.1 → (1.1w)×(1.1h), charge conserved via area_ratio
 halo_legalize = 0.1
 mGP_hard_macro_density_weight = 1.2  # charge weight for hard macros in mGP density map (>1 = stronger repulsion)
 mGP_soft_macro_density_weight = 0.8  # charge weight for soft macros in mGP density map (<1 = weaker repulsion)
@@ -113,15 +113,16 @@ conv_divergence  = true   # stop when wl > 5×best AND overflow trending up
 convergence_countdown = 30  # extra iters to run after convergence before stopping
 
 [ga]
-ga_enable  = false   # set true to run genetic algorithm over hyperparameters
+ga_enable  = false # set true to run genetic algorithm over hyperparameters
 pop_size   = 16      # individuals per generation
 n_gens     = 5       # number of generations
 elite_k    = 2       # top-k individuals carried unchanged to next generation
 tourn_k    = 3       # tournament selection size
 mut_rate   = 0.25    # per-gene mutation probability
 seed       = 0       # RNG seed for GA (independent of placer seed)
-time_limit_mins = 55 # total budget; GA stops with len(final_seeds)*avg_run reserved for the seed sweep
-final_seeds = [1, 2, 3, 42, 67, 69, 420, 6969]  # after GA, replay best_genes with each seed; [] = disabled
+time_limit_mins = 50 # total budget; each run (GA + seed sweep) checks elapsed + avg_run before starting
+perform_seed_sweep = true # replay best_genes with final_seeds after GA; disabled by default (consumes most of the time budget on larger benchmarks)
+final_seeds = [42, 67, 420, 6969]  # seeds used when perform_seed_sweep = true
 
 [congestion]
 cong_rudy_enable    = true   # compute RUDY congestion map after placement (diagnostic only for now)
